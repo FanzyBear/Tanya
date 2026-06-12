@@ -1,23 +1,6 @@
-# recon-pipeline
+# recon-pipeline v2.0
 
-A modular, menu-driven web recon pipeline for bug bounty and penetration testing.
-
-```
- ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
- ██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║
- ██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║
- ██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║
- ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
- ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝
-```
-
-## Features
-
-- **Interactive menu** — pick modules individually or run the full pipeline
-- **8 recon modules** — subdomains, HTTP, ports, JS mining, params, dorks, cloud, screenshots
-- **Graceful fallbacks** — works with whatever tools you have installed; warns on missing ones
-- **Telegram alerts** — optional notifications after each phase
-- **Timestamped output** — every run gets its own folder, nothing overwrites
+A modular, menu-driven web recon pipeline with asset correlation, scoring, and structured output.
 
 ## Quick Start
 
@@ -26,100 +9,139 @@ git clone https://github.com/yourname/recon-pipeline
 cd recon-pipeline
 chmod +x recon.sh install.sh
 
-# Install dependencies
-./install.sh
+./install.sh              # install Go + pip tools
+./recon.sh example.com    # interactive menu
+```
 
-# Run interactively
-./recon.sh example.com
+## Usage
 
-# Run full pipeline
-./recon.sh example.com --full
-
-# Run a single module
-./recon.sh example.com --module subdomains
-./recon.sh example.com --module js
+```
+./recon.sh <domain>                       Interactive menu
+./recon.sh <domain> --full                Full pipeline
+./recon.sh <domain> --resume              Resume interrupted run
+./recon.sh <domain> --module <name>       Single module
 ```
 
 ## Modules
 
-| # | Module | Tools Used | What It Does |
+| # | Module | Key Tools | What It Does |
 |---|--------|-----------|--------------|
-| 1 | `subdomains` | subfinder, amass, crt.sh, dnsx | Passive + active subdomain enum |
-| 2 | `http` | httpx | Probe live services, detect tech |
-| 3 | `ports` | naabu | Scan non-standard ports |
-| 4 | `js` | gau, katana | Download JS, extract endpoints & secrets |
-| 5 | `params` | gau, waybackurls | Mine historical URLs, filter juicy params |
-| 6 | `dorks` | *(manual)* | Generate Google dorks list |
-| 7 | `cloud` | s3scanner | Enumerate S3/cloud bucket permutations |
-| 8 | `screenshots` | gowitness, eyewitness | Screenshot all live HTTP services |
+| 1 | `subdomains` | subfinder, amass, crt.sh, dnsx | Passive + active enum, normalisation, wildcard filtering |
+| 2 | `http` | httpx | Probe services, classify by status, flag interesting tech |
+| 3 | `ports` | naabu | Port scan, service scoring, flag Redis/Elastic/Docker |
+| 4 | `js` | gau, katana | Parallel JS download, endpoint extraction, secret detection |
+| 5 | `params` | gau, waybackurls | Historical URL mining, classify SSRF/redirect/IDOR/LFI |
+| 6 | `dorks` | *(manual)* | Generate Google + GitHub dork lists |
+| 7 | `cloud` | s3scanner | S3/GCS/Azure bucket permutation scan |
+| 8 | `screenshots` | gowitness | Screenshot all live services |
+| 9 | `correlate` | Python/SQLite | Cross-link all findings, score, generate report |
+
+## What's New in v2.0
+
+### Correctness fixes
+- **No more `set -e` + `|| true` conflict** — strict error model, intentional suppression only
+- **Input validation** — FQDN regex check, wildcard rejection, DNS sanity check on startup
+- **Subdomain normalisation** — lowercase, strip `*.`, FQDN regex validation, dedup
+- **Wildcard DNS detection** — random label probe; wildcard IPs filtered from live results
+- **HTTP response classification** — grouped by 200/301/403/401; title-based dedup
+- **JS secret detection with context** — beautify-lite preprocessing, context window, skip placeholders
+- **Parameter vulnerability classification** — SSRF / redirect / IDOR / LFI per URL
+- **Retry with exponential backoff** — crt.sh, gau, waybackurls retried on failure
+- **Parallel JS downloads** — 20 concurrent workers via xargs
+
+### Architecture upgrades
+- **SQLite asset graph** — every subdomain, port, service, JS finding, and parameter stored and queryable
+- **Cross-module correlation** — links subdomain → port → HTTP service → JS endpoint → parameter
+- **Prioritised scoring** — every finding scored 1–10; top findings surfaced automatically
+- **Markdown report** — auto-generated with summary, top attack surfaces, SSRF/redirect lists
+- **Resume capability** — `--resume` skips already-completed modules
+- **Full run log** — everything tee'd to `recon.log`
 
 ## Output Structure
 
 ```
 output/
 └── example.com_20260611_143022/
+    ├── recon.log
+    ├── recon.db                    ← SQLite asset graph
+    ├── .state                      ← completed modules (resume)
     ├── subdomains/
-    │   ├── subfinder.txt
-    │   ├── amass.txt
-    │   ├── crtsh.txt
-    │   ├── all_subs.txt
-    │   └── live_subs.txt       ← resolved live hosts
+    │   ├── all_subs.txt            ← normalised + validated
+    │   ├── live_subs.txt           ← wildcard-filtered
+    │   └── host_ip_pairs.txt
     ├── http/
-    │   ├── httpx_results.txt
+    │   ├── httpx_raw.jsonl
     │   ├── live_urls.txt
-    │   └── interesting.txt     ← Jenkins, Grafana, admin panels
+    │   ├── status_200.txt
+    │   ├── status_401_403.txt
+    │   └── interesting.txt
     ├── ports/
     │   ├── open_ports.txt
-    │   └── high_interest.txt   ← Redis, MongoDB, Elasticsearch, Docker
+    │   └── high_interest.txt       ← score ≥8
     ├── js/
-    │   ├── js_urls.txt
-    │   ├── files/              ← downloaded JS files
     │   ├── endpoints.txt
-    │   └── potential_secrets.txt
+    │   └── potential_secrets.txt   ← kind + value + context
     ├── params/
-    │   ├── all_urls.txt
-    │   ├── parameterized.txt
-    │   └── juicy_params.txt    ← SSRF/redirect/IDOR candidates
+    │   ├── ssrf_params.txt
+    │   ├── redirect_params.txt
+    │   ├── idor_params.txt
+    │   └── lfi_params.txt
     ├── dorks/
-    │   └── dorks.txt
+    │   ├── dorks.txt
+    │   └── github_dorks.txt
     ├── cloud/
-    │   ├── bucket_names.txt
     │   └── open_buckets.txt
-    └── screenshots/
+    ├── screenshots/
+    └── report/
+        ├── report.md               ← prioritised markdown report
+        └── asset_graph.json        ← full correlation graph
 ```
+
+## Querying the Asset Graph
+
+```bash
+# Top findings by score
+sqlite3 output/example.com_*/recon.db \
+  "SELECT score, category, title, detail FROM findings ORDER BY score DESC LIMIT 20"
+
+# SSRF parameter candidates
+sqlite3 output/example.com_*/recon.db \
+  "SELECT url FROM parameters WHERE kind='ssrf'"
+
+# Hosts with Grafana service AND port 3000 open
+sqlite3 output/example.com_*/recon.db \
+  "SELECT DISTINCT o.host FROM open_ports o
+   JOIN http_services h ON h.subdomain=o.host
+   WHERE o.port=3000 AND h.tech LIKE '%Grafana%'"
+```
+
+## Scoring Reference
+
+| Finding | Score |
+|---------|-------|
+| Open S3 bucket | 10 |
+| Docker daemon (:2375) | 10 |
+| Redis (:6379) | 10 |
+| Kubernetes kubelet (:10250) | 10 |
+| SSRF parameter | 9 |
+| Elasticsearch (:9200) | 9 |
+| MongoDB (:27017) | 9 |
+| Open redirect parameter | 8 |
+| LFI parameter | 8 |
+| JS secret found | 8 |
+| Admin panel | 7 |
+| IDOR parameter | 7 |
 
 ## Configuration
 
-Copy `config.env` and fill in optional values:
-
 ```bash
-# Telegram alerts
+# config.env
 TELEGRAM_TOKEN="your_bot_token"
 TELEGRAM_CHAT_ID="your_chat_id"
-
-# GitHub dorking (future module)
-GITHUB_TOKEN="your_github_token"
-```
-
-## Dependencies
-
-Installed automatically by `install.sh` (requires Go + Python3):
-
-**Go tools:** subfinder, dnsx, httpx, naabu, katana, gau, waybackurls, gowitness, notify  
-**Python tools:** s3scanner  
-**Optional:** amass (via apt), eyewitness
-
-## Usage
-
-```
-./recon.sh <domain>                     Interactive menu
-./recon.sh <domain> --full              Run full pipeline
-./recon.sh <domain> --module <name>     Run specific module
-./recon.sh --help
+HTTPX_THREADS=50
+NAABU_THREADS=100
 ```
 
 ## Legal
 
-Only use against targets you have explicit permission to test.  
-Always stay within program scope.  
-Report responsibly.
+Only test targets you have explicit written permission to test. Stay in scope. Report responsibly.

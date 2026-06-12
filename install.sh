@@ -49,7 +49,7 @@ install_pip_tool() {
 
 echo -e "${CYAN}"
 echo "  ┌─────────────────────────────┐"
-echo "  │   Recon Pipeline Installer  │"
+echo "  │   TaNyaaaaaaaa~~ Installer  │"
 echo "  └─────────────────────────────┘"
 echo -e "${RESET}"
 

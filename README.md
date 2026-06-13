@@ -1,147 +1,165 @@
-# recon-pipeline v2.0
+# tanyaa — Web Recon Pipeline
 
-A modular, menu-driven web recon pipeline with asset correlation, scoring, and structured output.
-
-## Quick Start
-
-```bash
-git clone https://github.com/yourname/recon-pipeline
-cd recon-pipeline
-chmod +x recon.sh install.sh
-
-./install.sh              # install Go + pip tools
-./recon.sh example.com    # interactive menu
-```
-
-## Usage
+A modular, resumable web reconnaissance pipeline that chains together the best open-source recon tools into a single script. Run everything at once or pick individual modules. Results land in clean, organized text files — no database required.
 
 ```
-./recon.sh <domain>                       Interactive menu
-./recon.sh <domain> --full                Full pipeline
-./recon.sh <domain> --resume              Resume interrupted run
-./recon.sh <domain> --module <name>       Single module
+  ████████╗ █████╗ ███╗   ██╗██╗   ██╗ █████╗  █████╗
+     ██╔══╝██╔══██╗████╗  ██║╚██╗ ██╔╝██╔══██╗██╔══██╗
+     ██║   ███████║██╔██╗ ██║ ╚████╔╝ ███████║███████║
+     ██║   ██╔══██║██║╚██╗██║  ╚██╔╝  ██╔══██║██╔══██║
+     ██║   ██║  ██║██║ ╚████║   ██║   ██║  ██║██║  ██║
+     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝
+         Web Recon Pipeline v4.0 (txt-only)
 ```
+
+---
+
+## Features
+
+- **11 recon modules** covering the full passive-to-active attack surface
+- **Resume support** — interrupted runs pick up where they left off
+- **Interactive menu** or fully automated `--full` pipeline
+- **Telegram notifications** for long-running scans
+- **No database** — all output is plain `.txt` and `.json`
+
+---
 
 ## Modules
 
-| # | Module | Key Tools | What It Does |
-|---|--------|-----------|--------------|
-| 1 | `subdomains` | subfinder, amass, crt.sh, dnsx | Passive + active enum, normalisation, wildcard filtering |
-| 2 | `http` | httpx | Probe services, classify by status, flag interesting tech |
-| 3 | `ports` | naabu | Port scan, service scoring, flag Redis/Elastic/Docker |
-| 4 | `js` | gau, katana | Parallel JS download, endpoint extraction, secret detection |
-| 5 | `params` | gau, waybackurls | Historical URL mining, classify SSRF/redirect/IDOR/LFI |
-| 6 | `dorks` | *(manual)* | Generate Google + GitHub dork lists |
-| 7 | `cloud` | s3scanner | S3/GCS/Azure bucket permutation scan |
-| 8 | `screenshots` | gowitness | Screenshot all live services |
-| 9 | `correlate` | Python/SQLite | Cross-link all findings, score, generate report |
+| # | Module | Tools |
+|---|--------|-------|
+| 1 | Subdomain Enumeration | subfinder, assetfinder, amass, crt.sh |
+| 2 | HTTP Probing | httpx |
+| 3 | Port Scanning | naabu (nc fallback) |
+| 4 | Screenshots | gowitness (eyewitness fallback) |
+| 5 | URL Collection | katana, waybackurls, gau |
+| 6 | JavaScript Recon | curl + grep (endpoints, secrets) |
+| 7 | Directory Bruteforce | ffuf + SecLists |
+| 8 | Parameter Discovery | arjun + passive URL classification |
+| 9 | Vulnerability Scanning | nuclei (CVEs, exposures, misconfigs) |
+| 10 | Google Dorks | Generated dork list (manual) |
+| 11 | Cloud Bucket Recon | s3scanner |
 
-## What's New in v2.0
+---
 
-### Correctness fixes
-- **No more `set -e` + `|| true` conflict** — strict error model, intentional suppression only
-- **Input validation** — FQDN regex check, wildcard rejection, DNS sanity check on startup
-- **Subdomain normalisation** — lowercase, strip `*.`, FQDN regex validation, dedup
-- **Wildcard DNS detection** — random label probe; wildcard IPs filtered from live results
-- **HTTP response classification** — grouped by 200/301/403/401; title-based dedup
-- **JS secret detection with context** — beautify-lite preprocessing, context window, skip placeholders
-- **Parameter vulnerability classification** — SSRF / redirect / IDOR / LFI per URL
-- **Retry with exponential backoff** — crt.sh, gau, waybackurls retried on failure
-- **Parallel JS downloads** — 20 concurrent workers via xargs
-
-### Architecture upgrades
-- **SQLite asset graph** — every subdomain, port, service, JS finding, and parameter stored and queryable
-- **Cross-module correlation** — links subdomain → port → HTTP service → JS endpoint → parameter
-- **Prioritised scoring** — every finding scored 1–10; top findings surfaced automatically
-- **Markdown report** — auto-generated with summary, top attack surfaces, SSRF/redirect lists
-- **Resume capability** — `--resume` skips already-completed modules
-- **Full run log** — everything tee'd to `recon.log`
-
-## Output Structure
-
-```
-output/
-└── example.com_20260611_143022/
-    ├── recon.log
-    ├── recon.db                    ← SQLite asset graph
-    ├── .state                      ← completed modules (resume)
-    ├── subdomains/
-    │   ├── all_subs.txt            ← normalised + validated
-    │   ├── live_subs.txt           ← wildcard-filtered
-    │   └── host_ip_pairs.txt
-    ├── http/
-    │   ├── httpx_raw.jsonl
-    │   ├── live_urls.txt
-    │   ├── status_200.txt
-    │   ├── status_401_403.txt
-    │   └── interesting.txt
-    ├── ports/
-    │   ├── open_ports.txt
-    │   └── high_interest.txt       ← score ≥8
-    ├── js/
-    │   ├── endpoints.txt
-    │   └── potential_secrets.txt   ← kind + value + context
-    ├── params/
-    │   ├── ssrf_params.txt
-    │   ├── redirect_params.txt
-    │   ├── idor_params.txt
-    │   └── lfi_params.txt
-    ├── dorks/
-    │   ├── dorks.txt
-    │   └── github_dorks.txt
-    ├── cloud/
-    │   └── open_buckets.txt
-    ├── screenshots/
-    └── report/
-        ├── report.md               ← prioritised markdown report
-        └── asset_graph.json        ← full correlation graph
-```
-
-## Querying the Asset Graph
+## Installation
 
 ```bash
-# Top findings by score
-sqlite3 output/example.com_*/recon.db \
-  "SELECT score, category, title, detail FROM findings ORDER BY score DESC LIMIT 20"
-
-# SSRF parameter candidates
-sqlite3 output/example.com_*/recon.db \
-  "SELECT url FROM parameters WHERE kind='ssrf'"
-
-# Hosts with Grafana service AND port 3000 open
-sqlite3 output/example.com_*/recon.db \
-  "SELECT DISTINCT o.host FROM open_ports o
-   JOIN http_services h ON h.subdomain=o.host
-   WHERE o.port=3000 AND h.tech LIKE '%Grafana%'"
+git clone https://github.com/fanzybear/tanya.git
+cd tanya
+chmod +x install.sh tanyaa.sh
+./install.sh
 ```
 
-## Scoring Reference
+`install.sh` installs all Go tools, pip tools, and system packages, pulls nuclei templates, and optionally clones SecLists.
 
-| Finding | Score |
-|---------|-------|
-| Open S3 bucket | 10 |
-| Docker daemon (:2375) | 10 |
-| Redis (:6379) | 10 |
-| Kubernetes kubelet (:10250) | 10 |
-| SSRF parameter | 9 |
-| Elasticsearch (:9200) | 9 |
-| MongoDB (:27017) | 9 |
-| Open redirect parameter | 8 |
-| LFI parameter | 8 |
-| JS secret found | 8 |
-| Admin panel | 7 |
-| IDOR parameter | 7 |
+**Requirements:** Go 1.21+, Python 3, pip3, git
+
+---
+
+## Usage
+
+```bash
+# Interactive menu
+./tanyaa.sh example.com
+
+# Full automated pipeline
+./tanyaa.sh example.com --full
+
+# Resume an interrupted run
+./tanyaa.sh example.com --resume
+
+# Single module
+./tanyaa.sh example.com --module nuclei
+```
+
+Available module names: `subdomains` `http` `ports` `screenshots` `urls` `js` `fuzz` `params` `nuclei` `dorks` `cloud` `report`
+
+---
 
 ## Configuration
 
+Copy or create `config.env` in the same directory as the script:
+
 ```bash
 # config.env
-TELEGRAM_TOKEN="your_bot_token"
-TELEGRAM_CHAT_ID="your_chat_id"
+
+# Telegram notifications (optional)
+TELEGRAM_TOKEN=""
+TELEGRAM_CHAT_ID=""
+
+# Tool tuning
 HTTPX_THREADS=50
 NAABU_THREADS=100
+
+# Wordlist for ffuf (module 7)
+FFUF_WORDLIST="$HOME/SecLists/Discovery/Web-Content/common.txt"
 ```
 
-## Legal
+---
 
-Only test targets you have explicit written permission to test. Stay in scope. Report responsibly.
+## Output Structure
+
+Each run creates a timestamped folder under `./output/`:
+
+```
+output/example.com_20250601_120000/
+├── subdomains/
+│   ├── subs.txt              # merged, deduplicated subdomains
+│   ├── subfinder.txt
+│   ├── amass.txt
+│   └── crtsh.txt
+├── http/
+│   ├── alive.txt             # full httpx output
+│   ├── live_urls.txt
+│   ├── status_200.txt
+│   ├── status_401_403.txt
+│   └── interesting.txt       # high-value services (jenkins, kibana, etc.)
+├── ports/
+│   ├── ports.txt
+│   └── high_interest.txt     # flagged ports (redis, docker, elastic, etc.)
+├── screenshots/              # gowitness/eyewitness output
+├── urls/
+│   ├── urls.txt              # merged from katana + wayback + gau
+│   └── interesting_files.txt # .env, .sql, .bak, .log, etc.
+├── js/
+│   ├── js_urls.txt
+│   ├── files/                # downloaded JS files
+│   ├── endpoints.txt
+│   └── potential_secrets.txt # API keys, tokens, DSNs
+├── fuzz/                     # ffuf JSON results per target
+├── params/
+│   ├── parameterized.txt
+│   ├── ssrf_params.txt
+│   ├── redirect_params.txt
+│   ├── idor_params.txt
+│   └── lfi_params.txt
+├── nuclei/
+│   ├── nuclei.txt
+│   ├── nuclei_cves.txt
+│   ├── nuclei_exposures.txt
+│   └── nuclei_misconfig.txt
+├── dorks/
+│   ├── dorks.txt             # Google dorks (manual browser use)
+│   └── github_dorks.txt
+├── cloud/
+│   ├── bucket_names.txt
+│   ├── s3_results.txt
+│   └── open_buckets.txt
+├── report/
+│   └── report.txt            # summary of all findings
+├── recon.log
+└── .state                    # resume checkpoint
+```
+
+---
+
+## Disclaimer
+
+This tool is for authorized security testing and bug bounty research only. Only run against targets you have explicit permission to test. The author is not responsible for misuse.
+
+---
+
+## License
+
+MIT

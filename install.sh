@@ -1,208 +1,254 @@
-#!/bin/bash
-# install.sh — Install all recon pipeline dependencies for tanyaa.sh
-set -euo pipefail
+#!/usr/bin/env bash
+# ============================================================
+#  install.sh — dependency installer for tanya.sh
+#
+#  Tiers:
+#    core         curl, jq, python3            (required)
+#    recommended  subfinder httpx naabu nuclei katana ffuf
+#    optional     assetfinder amass waybackurls gau arjun
+#                 trufflehog gitleaks s3scanner dnsx cdncheck
+#                 + system: host/nslookup (dnsutils), nc (netcat)
+#
+#  Usage:
+#    ./install.sh                 core + recommended
+#    ./install.sh --optional      also install optional tools
+#    ./install.sh --seclists      also clone SecLists into ~/SecLists
+#    ./install.sh --all           recommended + optional + seclists
+#    ./install.sh --minimal       core only
+#    ./install.sh --help
+#
+#  Supports apt / dnf / pacman / brew for system packages, and
+#  `go install` for the Go-based recon tools (installs Go if absent).
+# ============================================================
+set -uo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RESET='\033[0m'
-ok()   { echo -e "${GREEN}[+]${RESET} $*"; }
-info() { echo -e "${CYAN}[*]${RESET} $*"; }
-warn() { echo -e "${YELLOW}[!]${RESET} $*"; }
-err()  { echo -e "${RED}[✗]${RESET} $*"; }
+# ── pretty output ────────────────────────────────────────────
+if [ -t 1 ]; then
+  G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; C='\033[0;36m'; B='\033[1m'; D='\033[2m'; X='\033[0m'
+else
+  G=''; Y=''; R=''; C=''; B=''; D=''; X=''
+fi
+say()  { echo -e "${C}::${X} $*"; }
+ok()   { echo -e "  ${G}✓${X} $*"; }
+warn() { echo -e "  ${Y}!${X} $*"; }
+err()  { echo -e "  ${R}✗${X} $*" >&2; }
+hr()   { echo -e "${D}────────────────────────────────────────────────────────${X}"; }
+has()  { command -v "$1" >/dev/null 2>&1; }
 
-TOOLS_OK=0
-TOOLS_FAIL=0
+# ── flags ────────────────────────────────────────────────────
+DO_RECOMMENDED=true
+DO_OPTIONAL=false
+DO_SECLISTS=false
+for a in "$@"; do
+  case "$a" in
+    --minimal)   DO_RECOMMENDED=false ;;
+    --optional)  DO_OPTIONAL=true ;;
+    --seclists)  DO_SECLISTS=true ;;
+    --all)       DO_OPTIONAL=true; DO_SECLISTS=true ;;
+    --help|-h)
+      cat <<'HELP'
+install.sh — dependency installer for tanya.sh
 
-check() {
-  if command -v "$1" &>/dev/null; then
-    ok "$1 already installed"
-    (( TOOLS_OK++ )) || true
-    return 0
-  fi
-  return 1
+Tiers:
+  core         curl, jq, python3                         (always installed)
+  recommended  subfinder httpx naabu nuclei katana ffuf  (default)
+  optional     assetfinder amass waybackurls gau arjun trufflehog
+               gitleaks s3scanner dnsx cdncheck + host/nslookup/nc
+
+Usage:
+  ./install.sh                core + recommended
+  ./install.sh --optional     also install optional tools
+  ./install.sh --seclists     also clone SecLists into ~/SecLists
+  ./install.sh --all          recommended + optional + seclists
+  ./install.sh --minimal      core only
+  ./install.sh --help         this help
+
+Uses apt / dnf / pacman / brew for system packages and `go install`
+for the Go-based recon tools (installs the Go toolchain if absent).
+HELP
+      exit 0 ;;
+    *) err "Unknown flag: $a (try --help)"; exit 1 ;;
+  esac
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GOBIN="${GOBIN:-$(go env GOPATH 2>/dev/null)/bin}"
+[ -z "${GOBIN%/bin}" ] && GOBIN="$HOME/go/bin"
+
+# ── detect system package manager ────────────────────────────
+PM=""; PM_INSTALL=""
+if has apt-get;   then PM="apt";    PM_INSTALL="sudo apt-get install -y"
+elif has dnf;     then PM="dnf";    PM_INSTALL="sudo dnf install -y"
+elif has pacman;  then PM="pacman"; PM_INSTALL="sudo pacman -S --noconfirm"
+elif has brew;    then PM="brew";   PM_INSTALL="brew install"
+fi
+
+pkg() { # pkg <generic-name> [apt] [dnf] [pacman] [brew]
+  local name="$1" apt="${2:-$1}" dnf="${3:-$1}" pac="${4:-$1}" brew="${5:-$1}" p
+  case "$PM" in
+    apt) p="$apt" ;; dnf) p="$dnf" ;; pacman) p="$pac" ;; brew) p="$brew" ;;
+    *) warn "no supported package manager — install '$name' manually"; return 1 ;;
+  esac
+  say "installing $name ($PM: $p)"
+  # shellcheck disable=SC2086
+  $PM_INSTALL $p >/dev/null 2>&1 && ok "$name" || { err "failed to install $name"; return 1; }
 }
 
-install_go_tool() {
-  local name="$1"; local pkg="$2"
-  check "$name" && return
-  info "Installing $name..."
-  if go install "$pkg" 2>/dev/null; then
-    ok "$name installed"
-    (( TOOLS_OK++ )) || true
+# go install helper: goget <binary> <module@version>
+goget() {
+  local bin="$1" mod="$2"
+  if has "$bin"; then ok "$bin (already present)"; return 0; fi
+  if ! has go; then err "Go toolchain missing — cannot install $bin"; return 1; fi
+  say "go install $bin"
+  if GOBIN="$GOBIN" go install "$mod" >/dev/null 2>&1; then
+    ok "$bin → $GOBIN"
   else
-    err "Failed to install $name ($pkg)"
-    (( TOOLS_FAIL++ )) || true
+    err "go install failed for $bin ($mod)"
+    return 1
   fi
 }
 
-install_pip_tool() {
-  local name="$1"; local pkg="$2"
-  check "$name" && return
-  info "Installing $name..."
-  if pip3 install --quiet "$pkg" 2>/dev/null; then
-    ok "$name installed"
-    (( TOOLS_OK++ )) || true
+# ── Go toolchain ─────────────────────────────────────────────
+ensure_go() {
+  if has go; then ok "go ($(go version | awk '{print $3}'))"; return 0; fi
+  say "Go toolchain not found — installing"
+  case "$PM" in
+    apt)    pkg go golang-go golang go go ;;
+    dnf)    pkg go golang   golang go go ;;
+    pacman) pkg go go       go     go go ;;
+    brew)   pkg go go       go     go go ;;
+    *) err "install Go manually from https://go.dev/dl/ then re-run"; return 1 ;;
+  esac
+  has go || { err "Go still not on PATH — open a new shell or add it, then re-run"; return 1; }
+}
+
+# ── tier: core ───────────────────────────────────────────────
+install_core() {
+  hr; say "${B}Core (required)${X}"
+  has curl    && ok "curl"    || pkg curl
+  has jq      && ok "jq"      || pkg jq
+  has python3 && ok "python3" || pkg python3 python3 python3 python python
+}
+
+# ── tier: recommended (Go tools) ─────────────────────────────
+install_recommended() {
+  hr; say "${B}Recommended recon tools${X}"
+  ensure_go || { warn "skipping Go tools"; return 0; }
+  goget subfinder "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+  goget httpx     "github.com/projectdiscovery/httpx/cmd/httpx@latest"
+  goget naabu     "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
+  goget nuclei    "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+  goget katana    "github.com/projectdiscovery/katana/cmd/katana@latest"
+  goget ffuf      "github.com/ffuf/ffuf/v2@latest"
+  if has nuclei; then
+    say "updating nuclei templates"
+    nuclei -update-templates >/dev/null 2>&1 && ok "nuclei templates" || warn "template update skipped"
+  fi
+  # naabu needs libpcap headers to build on Linux
+  if [ "$PM" = "apt" ] && ! has naabu; then
+    warn "naabu build often needs libpcap-dev: sudo apt-get install -y libpcap-dev"
+  fi
+}
+
+# ── tier: optional ───────────────────────────────────────────
+install_optional() {
+  hr; say "${B}Optional tools${X}"
+  ensure_go >/dev/null 2>&1
+  # Go-based
+  goget assetfinder "github.com/tomnomnom/assetfinder@latest"
+  goget waybackurls "github.com/tomnomnom/waybackurls@latest"
+  goget gau         "github.com/lc/gau/v2/cmd/gau@latest"
+  goget dnsx        "github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+  goget cdncheck    "github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest"
+  goget gitleaks    "github.com/gitleaks/gitleaks/v8@latest"
+  goget amass       "github.com/owasp-amass/amass/v4/...@master"
+  goget s3scanner   "github.com/sa7mon/s3scanner@latest"
+
+  # Python-based: arjun (prefer pipx, fall back to pip --user)
+  if has arjun; then ok "arjun (already present)"
+  elif has pipx; then say "pipx install arjun"; pipx install arjun >/dev/null 2>&1 && ok "arjun" || err "arjun (pipx) failed"
+  elif has pip3; then say "pip3 install --user arjun"; pip3 install --user arjun >/dev/null 2>&1 && ok "arjun" || err "arjun (pip) failed"
+  else warn "no pipx/pip3 — install arjun manually"; fi
+
+  # trufflehog (official installer script → GOBIN)
+  if has trufflehog; then ok "trufflehog (already present)"
   else
-    err "Failed to install $name"
-    (( TOOLS_FAIL++ )) || true
+    say "installing trufflehog"
+    if curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+         | sh -s -- -b "$GOBIN" >/dev/null 2>&1; then ok "trufflehog → $GOBIN"
+    else warn "trufflehog install script failed — see github.com/trufflesecurity/trufflehog"; fi
   fi
+
+  # system DNS/netcat utilities
+  hr; say "${B}System utilities${X}"
+  has nc      && ok "nc"      || pkg netcat  netcat-openbsd nmap-ncat openbsd-netcat netcat
+  has host    && ok "host"    || pkg host    dnsutils bind-utils bind-tools bind
+  has nslookup&& ok "nslookup"|| pkg nslookup dnsutils bind-utils bind-tools bind
 }
 
-echo -e "${CYAN}"
-echo "  ┌─────────────────────────────────────┐"
-echo "  │   tanyaa.sh — Dependency Installer  │"
-echo "  └─────────────────────────────────────┘"
-echo -e "${RESET}"
-
-# ── Check Prerequisites ───────────────────────────────────────
-info "Checking prerequisites..."
-
-GO_OK=false
-PY_OK=false
-
-if ! command -v go &>/dev/null; then
-  warn "Go not found — Go-based tools will be skipped"
-  warn "Install from: https://go.dev/dl/"
-else
-  ok "Go: $(go version | awk '{print $3}')"
-  export GOPATH="${GOPATH:-$HOME/go}"
-  export PATH="$PATH:$GOPATH/bin"
-  GO_OK=true
-fi
-
-if ! command -v python3 &>/dev/null; then
-  warn "Python3 not found — pip-based tools will be skipped"
-elif ! command -v pip3 &>/dev/null; then
-  warn "pip3 not found — pip-based tools will be skipped"
-else
-  ok "Python3: $(python3 --version)"
-  PY_OK=true
-fi
-
-# ── Go Tools ─────────────────────────────────────────────────
-# Used in: subdomains, http, ports, screenshots, urls, vuln scanning
-if $GO_OK; then
-  info "Installing Go-based tools..."
-
-  # MODULE 1 — Subdomain Enumeration
-  install_go_tool subfinder    "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
-  install_go_tool assetfinder  "github.com/tomnomnom/assetfinder@latest"
-
-  # MODULE 2 — HTTP Probing
-  install_go_tool httpx        "github.com/projectdiscovery/httpx/cmd/httpx@latest"
-
-  # MODULE 3 — Port Scanning
-  install_go_tool naabu        "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
-
-  # MODULE 4 — Screenshots
-  install_go_tool gowitness    "github.com/sensepost/gowitness@latest"
-
-  # MODULE 5 — URL Collection
-  install_go_tool katana       "github.com/projectdiscovery/katana/cmd/katana@latest"
-  install_go_tool gau          "github.com/lc/gau/v2/cmd/gau@latest"
-  install_go_tool waybackurls  "github.com/tomnomnom/waybackurls@latest"
-
-  # MODULE 7 — Directory Bruteforce
-  install_go_tool ffuf         "github.com/ffuf/ffuf/v2@latest"
-
-  # MODULE 9 — Vulnerability Scanning
-  install_go_tool nuclei       "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
-
-  # MODULE 6 — JS Secret Scanning (primary tools, grep is fallback)
-  install_go_tool trufflehog   "github.com/trufflesecurity/trufflehog/v3@latest"
-  install_go_tool gitleaks     "github.com/gitleaks/gitleaks/v8@latest"
-
-  # Utility
-  install_go_tool anew         "github.com/tomnomnom/anew@latest"
-  install_go_tool notify       "github.com/projectdiscovery/notify/cmd/notify@latest"
-  install_go_tool dnsx         "github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
-fi
-
-# ── Pip Tools ────────────────────────────────────────────────
-# Used in: cloud bucket recon, parameter discovery
-if $PY_OK; then
-  info "Installing Python-based tools..."
-
-  # MODULE 8 — Parameter Discovery
-  install_pip_tool arjun    "arjun"
-
-  # MODULE 11 — Cloud Bucket Recon
-  install_pip_tool s3scanner "s3scanner"
-fi
-
-# ── Package Manager Tools ─────────────────────────────────────
-# MODULE 1 — Subdomain Enumeration (amass)
-# MODULE 4 — Screenshots (eyewitness fallback)
-if command -v apt-get &>/dev/null; then
-  info "Installing system packages..."
-
-  sudo apt-get install -y -q amass 2>/dev/null \
-    && ok "amass installed" \
-    || warn "amass: install manually → https://github.com/owasp-amass/amass/releases"
-
-  # eyewitness is a fallback for gowitness (module 4)
-  if ! command -v gowitness &>/dev/null; then
-    sudo apt-get install -y -q eyewitness 2>/dev/null \
-      && ok "eyewitness installed" \
-      || warn "eyewitness: install manually → https://github.com/RedSiege/EyeWitness"
-  fi
-
-elif command -v brew &>/dev/null; then
-  info "Homebrew detected — installing system packages..."
-  brew install amass 2>/dev/null && ok "amass installed" || warn "amass: brew install failed"
-else
-  warn "No supported package manager (apt/brew) — install amass manually"
-  warn "  → https://github.com/owasp-amass/amass/releases"
-fi
-
-# ── nuclei templates ──────────────────────────────────────────
-if command -v nuclei &>/dev/null; then
-  info "Updating nuclei templates..."
-  nuclei -update-templates -silent 2>/dev/null && ok "nuclei templates updated" \
-    || warn "nuclei template update failed — run: nuclei -update-templates"
-fi
-
-# ── SecLists (wordlist for ffuf) ──────────────────────────────
-SECLIST_DIR="$HOME/SecLists"
-FFUF_WORDLIST="$SECLIST_DIR/Discovery/Web-Content/common.txt"
-
-if [ ! -f "$FFUF_WORDLIST" ]; then
-  warn "SecLists not found at $SECLIST_DIR"
-  if command -v git &>/dev/null; then
-    read -rp "$(echo -e "${CYAN}[?]${RESET} Clone SecLists now? (~1GB) [y/N]: ")" yn
-    if [[ "${yn,,}" == "y" ]]; then
-      info "Cloning SecLists..."
-      git clone --depth 1 https://github.com/danielmiessler/SecLists.git "$SECLIST_DIR" \
-        && ok "SecLists cloned → $SECLIST_DIR" \
-        || warn "SecLists clone failed — clone manually: https://github.com/danielmiessler/SecLists"
+# ── SecLists ─────────────────────────────────────────────────
+install_seclists() {
+  hr; say "${B}SecLists wordlists${X}"
+  local dest="$HOME/SecLists"
+  if [ -d "$dest/.git" ] || [ -d "$dest/Discovery" ]; then
+    ok "SecLists already at $dest"
+  else
+    say "cloning SecLists (shallow) → $dest"
+    if git clone --depth 1 https://github.com/danielmiessler/SecLists.git "$dest" >/dev/null 2>&1; then
+      ok "SecLists → $dest"
     else
-      warn "Skipping SecLists — set FFUF_WORDLIST in config.env to your wordlist path"
+      err "clone failed — fetch manually from github.com/danielmiessler/SecLists"
     fi
+  fi
+}
+
+# ── starter config + executable bit ──────────────────────────
+finalize() {
+  hr; say "${B}Finishing up${X}"
+  local cfg="$SCRIPT_DIR/config.env"
+  if [ -f "$cfg" ]; then
+    ok "config.env exists (left untouched)"
   else
-    warn "git not found — clone SecLists manually: https://github.com/danielmiessler/SecLists"
-    warn "Then set FFUF_WORDLIST in config.env"
+    cat > "$cfg" <<'CFG'
+# tanya.sh configuration — all keys optional, sourced at startup.
+HTTPX_THREADS=50
+NAABU_THREADS=100
+NAABU_RATE=1000
+KATANA_DEPTH=3
+FFUF_THREADS=40
+FFUF_WORDLIST="$HOME/SecLists/Discovery/Web-Content/common.txt"
+CURL_UA="Mozilla/5.0 (recon; +tanya.sh)"
+
+# Optional API keys for richer origin discovery (blank = skipped)
+SECURITYTRAILS_API_KEY=""
+SHODAN_API_KEY=""
+CFG
+    ok "wrote starter config.env"
   fi
-else
-  ok "SecLists wordlist found: $FFUF_WORDLIST"
-fi
-
-# ── Add Go bin to PATH ────────────────────────────────────────
-SHELL_RC=""
-[ -f "$HOME/.zshrc"  ] && SHELL_RC="$HOME/.zshrc"
-[ -f "$HOME/.bashrc" ] && SHELL_RC="$HOME/.bashrc"
-
-if [[ -n "$SHELL_RC" ]] && $GO_OK; then
-  if ! grep -q 'GOPATH/bin' "$SHELL_RC" 2>/dev/null; then
-    echo 'export PATH="$PATH:$HOME/go/bin"' >> "$SHELL_RC"
-    info "Added \$HOME/go/bin to PATH in $SHELL_RC"
+  if [ -f "$SCRIPT_DIR/tanya.sh" ]; then
+    chmod +x "$SCRIPT_DIR/tanya.sh" && ok "tanya.sh is executable"
+  else
+    warn "tanya.sh not found next to install.sh — place it here before running"
   fi
-fi
 
-# ── Summary ───────────────────────────────────────────────────
-echo ""
-echo -e "${CYAN}━━━ Install Summary ━━━${RESET}"
-ok "Installed/available : $TOOLS_OK"
-[ "$TOOLS_FAIL" -gt 0 ] && warn "Failed              : $TOOLS_FAIL (check output above)"
-echo ""
-info "Next steps:"
-info "  1. Reload shell  →  source ~/.bashrc  (or restart terminal)"
-info "  2. Make executable →  chmod +x tanyaa.sh"
-info "  3. Run recon     →  ./tanyaa.sh example.com"
+  # PATH hint for Go bin
+  case ":$PATH:" in
+    *":$GOBIN:"*) : ;;
+    *) warn "add Go bin to PATH:  export PATH=\"\$PATH:$GOBIN\""
+       warn "  (append that line to your ~/.bashrc or ~/.zshrc to persist)" ;;
+  esac
+}
+
+# ── run ──────────────────────────────────────────────────────
+echo -e "${B}${C}tanya.sh installer${X}"
+[ -n "$PM" ] && say "package manager: $PM" || warn "no apt/dnf/pacman/brew detected — system packages must be installed manually"
+
+install_core
+$DO_RECOMMENDED && install_recommended
+$DO_OPTIONAL    && install_optional
+$DO_SECLISTS    && install_seclists
+finalize
+
+hr
+say "${B}Done.${X} Verify with:  ${C}./tanya.sh example.com --help${X}"
+say "Run a scan with:  ${C}./tanya.sh example.com --full${X}  ${D}(authorized targets only)${X}"

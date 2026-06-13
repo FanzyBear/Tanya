@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================
-#  tanya.sh — Web Recon Pipeline v5.3 (txt/jsonl, no DB)
+#  tanya.sh — Web Recon Pipeline v5.4 (txt/jsonl, no DB)
+#
+#  v5.4 changes:
+#    · empty output files are pruned automatically (no more 0-byte clutter)
+#    · report now has a prioritized "WHERE TO START" triage + module status
+#    · proper enclosed UI boxes (auto-width, ANSI-aware) for run/summary
+#    · interactive menu shows checkmarks for already-completed modules
+#    · fixed a grep -c double-count bug in the nuclei severity tally
 #
 #  Usage:
 #    ./tanya.sh <target> [options]
@@ -91,7 +98,7 @@ banner() {
   _log "${CYAN}     ██║   ██╔══██║██║╚██╗██║  ╚██╔╝  ██╔══██║${RESET}        ${DIM}\`-.-' \\ )-\`( , o o)${RESET}"
   _log "${CYAN}     ██║   ██║  ██║██║ ╚████║   ██║   ██║  ██║${RESET}             ${DIM}\`-    \\\`_\`\"'-${RESET}"
   _log "${CYAN}     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝${RESET}"
-  _log "        ${BOLD}Web Recon Pipeline${RESET} ${GREEN}v5.3${RESET}  ${DIM}— authorized targets only${RESET}"
+  _log "        ${BOLD}Web Recon Pipeline${RESET} ${GREEN}v5.4${RESET}  ${DIM}— authorized targets only${RESET}"
   _log ""
 }
 
@@ -104,6 +111,52 @@ count() { if [ -f "$1" ]; then awk 'END{print NR+0}' "$1" 2>/dev/null; else echo
 
 # Non-empty file?
 nonempty() { [ -s "$1" ]; }
+
+# Visible length of a string, ignoring our literal \033[...m color codes.
+# (Color vars hold the *text* "\033[..m"; echo -e renders them, so we strip
+#  that literal pattern to measure how wide the line will actually print.)
+_vlen() {
+  local s
+  s=$(printf '%s' "$1" | sed -E 's/\\033\[[0-9;]*m//g')
+  printf '%s' "${#s}"
+}
+
+# Draw a fully-enclosed, auto-width box around a title + body lines.
+# Usage: box "<COLOR>" "TITLE" "line1" "line2" ...
+# Width adapts to the widest visible line; ANSI color codes don't break it.
+box() {
+  local color="$1"; shift
+  local title="$1"; shift
+  local lines=("$@") l vl maxw=0
+  vl=$(_vlen "$title"); (( vl > maxw )) && maxw=$vl
+  for l in "${lines[@]}"; do vl=$(_vlen "$l"); (( vl > maxw )) && maxw=$vl; done
+  local innerw=$(( maxw + 4 ))                 # 2-space pad on each side
+  local bar; bar=$(printf '═%.0s' $(seq 1 "$innerw"))
+  local thin; thin=$(printf '─%.0s' $(seq 1 "$innerw"))
+  _log "${color}╔${bar}╗${RESET}"
+  vl=$(_vlen "$title")
+  _log "$(printf "${color}║${RESET}  %b%*s${color}║${RESET}" "$title" "$(( innerw - 2 - vl ))" "")"
+  if [ "${#lines[@]}" -gt 0 ]; then
+    _log "${color}╟${thin}╢${RESET}"
+    for l in "${lines[@]}"; do
+      vl=$(_vlen "$l"); local rpad=$(( innerw - 2 - vl )); (( rpad < 0 )) && rpad=0
+      _log "$(printf "${color}║${RESET}  %b%*s${color}║${RESET}" "$l" "$rpad" "")"
+    done
+  fi
+  _log "${color}╚${bar}╝${RESET}"
+}
+
+# Delete zero-byte output files (and now-empty dirs) so the run dir only
+# contains files that actually have findings. Protects the log + state file.
+prune_empty() {
+  local root="${1:-$OUT_DIR}"
+  [ -d "$root" ] || return 0
+  find "$root" -type f -empty ! -name 'recon.log' ! -name '.state' -delete 2>/dev/null || true
+  find "$root" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+}
+
+# Status glyph for the interactive menu: ✓ if a module already ran this run.
+_mk() { state_is_done "$1" 2>/dev/null && printf "${GREEN}✓${RESET}" || printf "${DIM}·${RESET}"; }
 
 run_tool() {
   local label="$1"; shift
@@ -820,10 +873,10 @@ run_nuclei() {
 
   local total crit high med low cve_n
   total=$(count "$dir/findings.txt")
-  crit=$(grep -c '\[critical\]' "$dir/findings.txt" 2>/dev/null || echo 0)
-  high=$(grep -c '\[high\]'     "$dir/findings.txt" 2>/dev/null || echo 0)
-  med=$(grep -c '\[medium\]'    "$dir/findings.txt" 2>/dev/null || echo 0)
-  low=$(grep -c '\[low\]'       "$dir/findings.txt" 2>/dev/null || echo 0)
+  crit=$(grep -c '\[critical\]' "$dir/findings.txt" 2>/dev/null) || crit=0
+  high=$(grep -c '\[high\]'     "$dir/findings.txt" 2>/dev/null) || high=0
+  med=$(grep -c  '\[medium\]'   "$dir/findings.txt" 2>/dev/null) || med=0
+  low=$(grep -c  '\[low\]'      "$dir/findings.txt" 2>/dev/null) || low=0
   cve_n=$(count "$dir/cves.txt")
 
   ok "Nuclei: $total unique finding(s) → $dir/findings.txt"
@@ -917,48 +970,132 @@ run_cloud() {
 
 # ── Report ───────────────────────────────────────────────────
 run_report() {
+  prune_empty "$OUT_DIR"            # clean 0-byte files before we list anything
   section "GENERATING REPORT"
   local dir="$OUT_DIR/report"
   mkdir -p "$dir"
   local report="$dir/report.txt"
+
+  # ---- gather counts once ----
+  local subs live waf orig_c orig openb sec intsvc hiport
+  subs=$(count "$OUT_DIR/subdomains/subs.txt")
+  live=$(count "$OUT_DIR/http/live_urls.txt")
+  waf=$(count "$OUT_DIR/http/waf.txt")
+  orig_c=$(count "$OUT_DIR/origin/origin_candidates.txt")
+  orig=$(count "$OUT_DIR/origin/origins.txt")
+  openb=$(count "$OUT_DIR/cloud/open_buckets.txt")
+  sec=$(count "$OUT_DIR/js/potential_secrets.txt")
+  intsvc=$(count "$OUT_DIR/http/interesting.txt")
+  hiport=$(count "$OUT_DIR/ports/high_interest.txt")
+
+  local cve nfind ncrit nhigh
+  cve=$(count "$OUT_DIR/nuclei/cves.txt")
+  nfind=$(count "$OUT_DIR/nuclei/findings.txt")
+  ncrit=0; nhigh=0
+  if [ -f "$OUT_DIR/nuclei/findings.txt" ]; then
+    ncrit=$(grep -c '\[critical\]' "$OUT_DIR/nuclei/findings.txt" 2>/dev/null) || ncrit=0
+    nhigh=$(grep -c '\[high\]'     "$OUT_DIR/nuclei/findings.txt" 2>/dev/null) || nhigh=0
+  fi
+
+  local ssrf redir idor lfi intfiles
+  ssrf=$(count "$OUT_DIR/params/ssrf_params.txt")
+  redir=$(count "$OUT_DIR/params/redirect_params.txt")
+  idor=$(count "$OUT_DIR/params/idor_params.txt")
+  lfi=$(count "$OUT_DIR/params/lfi_params.txt")
+  intfiles=$(count "$OUT_DIR/urls/interesting_files.txt")
+
+  # ---- build prioritized triage list (tab-separated: GLYPH \t TEXT \t REL_PATH) ----
+  local -a TRIAGE=()
+  _t() { [ "${1:-0}" -gt 0 ] && TRIAGE+=("$2"$'\t'"$3"$'\t'"$4") || true; }
+  _t "$ncrit"   "[!!!]" "$ncrit CRITICAL nuclei finding(s)"          "nuclei/findings.txt"
+  _t "$openb"   "[!!!]" "$openb PUBLICLY exposed cloud bucket(s)"    "cloud/open_buckets.txt"
+  _t "$nhigh"   "[!! ]" "$nhigh HIGH nuclei finding(s)"             "nuclei/findings.txt"
+  _t "$cve"     "[!! ]" "$cve CVE match(es)"                        "nuclei/cves.txt"
+  _t "$sec"     "[!! ]" "$sec potential secret(s) in JS"            "js/potential_secrets.txt"
+  _t "$orig"    "[!  ]" "$orig confirmed ORIGIN IP(s) (CDN bypass)" "origin/confirmed_origins.txt"
+  _t "$intsvc"  "[!  ]" "$intsvc interesting service(s) exposed"    "http/interesting.txt"
+  _t "$hiport"  "[!  ]" "$hiport high-risk open port(s)"            "ports/high_interest.txt"
+  _t "$ssrf"    "[ ? ]" "$ssrf SSRF param candidate(s)"             "params/ssrf_params.txt"
+  _t "$idor"    "[ ? ]" "$idor IDOR param candidate(s)"             "params/idor_params.txt"
+  _t "$lfi"     "[ ? ]" "$lfi LFI param candidate(s)"              "params/lfi_params.txt"
+  _t "$redir"   "[ ? ]" "$redir open-redirect candidate(s)"        "params/redirect_params.txt"
+  _t "$intfiles" "[ ? ]" "$intfiles interesting file URL(s)"       "urls/interesting_files.txt"
+
+  # ---- module run status from .state ----
+  local order=(subdomains http origin ports urls js fuzz params nuclei dorks cloud)
+
   {
-    echo "========================================"
-    echo "  RECON REPORT: $TARGET_HOST"
-    echo "  scope mode : $SCOPE_MODE"
+    echo "════════════════════════════════════════════════════════"
+    echo "  RECON REPORT — $TARGET_HOST"
+    echo "  scope mode : $SCOPE_MODE$([ "$PASSIVE" = true ] && echo '  (passive)')"
     echo "  generated  : $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "========================================"
-    echo ""
-    echo "-- SUMMARY -----------------------------"
-    printf "  %-22s %s\n" "In-scope hosts:"  "$(count "$OUT_DIR/subdomains/subs.txt")"
-    printf "  %-22s %s\n" "Live URLs:"        "$(count "$OUT_DIR/http/live_urls.txt")"
-    printf "  %-22s %s\n" "WAF detections:"   "$(count "$OUT_DIR/http/waf.txt")"
-    printf "  %-22s %s\n" "Origin candidates:" "$(count "$OUT_DIR/origin/origin_candidates.txt")"
-    printf "  %-22s %s\n" "Confirmed origins:" "$(count "$OUT_DIR/origin/origins.txt")"
-    printf "  %-22s %s\n" "Open ports:"       "$(count "$OUT_DIR/ports/ports.txt")"
-    printf "  %-22s %s\n" "Total URLs:"       "$(count "$OUT_DIR/urls/urls.txt")"
-    printf "  %-22s %s\n" "JS endpoints:"     "$(count "$OUT_DIR/js/endpoints.txt")"
-    printf "  %-22s %s\n" "Secret hits:"      "$(count "$OUT_DIR/js/potential_secrets.txt")"
-    printf "  %-22s %s\n" "Param URLs:"       "$(count "$OUT_DIR/params/parameterized.txt")"
-    printf "  %-22s %s\n" "SSRF candidates:"  "$(count "$OUT_DIR/params/ssrf_params.txt")"
-    printf "  %-22s %s\n" "Redirect cands:"   "$(count "$OUT_DIR/params/redirect_params.txt")"
-    printf "  %-22s %s\n" "Nuclei findings:"  "$(count "$OUT_DIR/nuclei/findings.txt")"
+    echo "  output dir : $OUT_DIR"
+    echo "════════════════════════════════════════════════════════"
     echo ""
 
-    _block() { [ "$(count "$2")" -gt 0 ] && { echo "-- $1"; head -"${3:-50}" "$2"; echo ""; }; }
+    echo "── MODULE STATUS ───────────────────────────────────────"
+    local m line=""
+    for m in "${order[@]}"; do
+      if state_is_done "$m"; then line+="  [x] $m"; else line+="  [ ] $m"; fi
+    done
+    echo "$line"
+    echo ""
+
+    echo "── WHERE TO START (highest signal first) ───────────────"
+    if [ "${#TRIAGE[@]}" -eq 0 ]; then
+      echo "  No high-signal findings were flagged automatically."
+      echo "  Good manual starting points:"
+      [ "$live" -gt 0 ]     && echo "    → http/alive.txt            (every live service + title/tech)"
+      [ "$(count "$OUT_DIR/urls/urls.txt")" -gt 0 ] && \
+                              echo "    → urls/urls.txt             (full URL archive)"
+      [ "$(count "$OUT_DIR/params/parameterized.txt")" -gt 0 ] && \
+                              echo "    → params/parameterized.txt  (URLs carrying parameters)"
+      [ "$(count "$OUT_DIR/dorks/google_dorks.txt")" -gt 0 ] && \
+                              echo "    → dorks/google_dorks.txt    (paste into a browser)"
+    else
+      local g txt p
+      while IFS=$'\t' read -r g txt p; do
+        printf "  %-5s %-46s → %s\n" "$g" "$txt" "$OUT_DIR/$p"
+      done < <(printf '%s\n' "${TRIAGE[@]}")
+      echo ""
+      echo "  legend:  [!!!] critical / act now   [!! ] high   [!  ] notable   [ ? ] candidate to test"
+    fi
+    echo ""
+
+    echo "── SUMMARY ─────────────────────────────────────────────"
+    printf "  %-22s %s\n" "In-scope hosts:"   "$subs"
+    printf "  %-22s %s\n" "Live URLs:"         "$live"
+    printf "  %-22s %s\n" "WAF detections:"    "$waf"
+    printf "  %-22s %s\n" "Origin candidates:" "$orig_c"
+    printf "  %-22s %s\n" "Confirmed origins:" "$orig"
+    printf "  %-22s %s\n" "Open ports:"        "$(count "$OUT_DIR/ports/ports.txt")"
+    printf "  %-22s %s\n" "Total URLs:"        "$(count "$OUT_DIR/urls/urls.txt")"
+    printf "  %-22s %s\n" "JS endpoints:"      "$(count "$OUT_DIR/js/endpoints.txt")"
+    printf "  %-22s %s\n" "Secret hits:"       "$sec"
+    printf "  %-22s %s\n" "Param URLs:"        "$(count "$OUT_DIR/params/parameterized.txt")"
+    printf "  %-22s %s\n" "Public buckets:"    "$openb"
+    printf "  %-22s %s\n" "Nuclei findings:"   "$nfind"
+    printf "  %-22s %s\n" "  └ critical/high:" "$ncrit / $nhigh"
+    echo ""
+
+    _block() { [ "$(count "$2")" -gt 0 ] && { echo "── $1"; head -"${3:-50}" "$2"; echo ""; }; }
     _block "WAF DETECTIONS"            "$OUT_DIR/http/waf.txt"
     _block "CONFIRMED ORIGIN IPs"      "$OUT_DIR/origin/confirmed_origins.txt"
+    _block "PUBLIC CLOUD BUCKETS"      "$OUT_DIR/cloud/open_buckets.txt"
     _block "HIGH-RISK PORTS"           "$OUT_DIR/ports/high_interest.txt"
     _block "INTERESTING SERVICES"      "$OUT_DIR/http/interesting.txt"
     _block "SSRF CANDIDATES (top 20)"  "$OUT_DIR/params/ssrf_params.txt" 20
     _block "REDIRECT CANDIDATES (20)"  "$OUT_DIR/params/redirect_params.txt" 20
     _block "POTENTIAL SECRETS (20)"    "$OUT_DIR/js/potential_secrets.txt" 20
 
-    echo "-- OUTPUT FILES (full paths) -----------"
+    echo "── OUTPUT FILES (non-empty only) ───────────────────────"
     find "$OUT_DIR" -type f \( -name '*.txt' -o -name '*.jsonl' -o -name '*.json' \) \
       | sort
     echo ""
-    echo "========================================"
-  } | tee "$report"
+    echo "════════════════════════════════════════════════════════"
+  } > "$report"
+
+  cat "$report"
   ok "Report → $report"
 }
 
@@ -979,6 +1116,7 @@ run_full() {
   run_cloud
   run_report
   STEP_TOTAL=0
+  prune_empty "$OUT_DIR"            # final sweep of any 0-byte files
   local elapsed=$(( SECONDS - start ))
   local mm=$(( elapsed / 60 )) ss=$(( elapsed % 60 ))
 
@@ -989,35 +1127,32 @@ run_full() {
   orig=$(count "$OUT_DIR/origin/origins.txt")
   nucl=$(count "$OUT_DIR/nuclei/findings.txt")
   echo ""
-  _log "  ${GREEN}╔════════════════════════════════════════════${RESET}"
-  _log "  ${GREEN}║${RESET}  ${BOLD}${GREEN}SCAN COMPLETE${RESET}  ${DIM}$TARGET_HOST${RESET}"
-  _log "  ${GREEN}║${RESET}"
-  _log "  ${GREEN}║${RESET}  hosts ${BOLD}$subs${RESET}   live ${BOLD}$live${RESET}   origins ${BOLD}$orig${RESET}   nuclei ${BOLD}$nucl${RESET}"
-  _log "  ${GREEN}║${RESET}  elapsed ${BOLD}${mm}m ${ss}s${RESET}"
-  _log "  ${GREEN}╚════════════════════════════════════════════${RESET}"
-  _log "  ${DIM}→ output: $OUT_DIR${RESET}"
-  _log "  ${DIM}→ report: $OUT_DIR/report/report.txt${RESET}"
+  box "$GREEN" "${BOLD}${GREEN}SCAN COMPLETE${RESET}  ${DIM}$TARGET_HOST${RESET}" \
+    "hosts ${BOLD}$subs${RESET}   live ${BOLD}$live${RESET}   origins ${BOLD}$orig${RESET}   nuclei ${BOLD}$nucl${RESET}" \
+    "elapsed ${BOLD}${mm}m ${ss}s${RESET}" \
+    "report  ${CYAN}$OUT_DIR/report/report.txt${RESET}"
+  _log "  ${DIM}→ open the report above — it lists where to start.${RESET}"
 }
 
 # ── Interactive menu ─────────────────────────────────────────
 interactive_menu() {
   while true; do
-    local pmode=""; [ "$PASSIVE" = true ] && pmode="  ${MAGENTA}· passive${RESET}"
+    local pmode="${SCOPE_MODE}"; [ "$PASSIVE" = true ] && pmode="${SCOPE_MODE} · passive"
     echo ""
-    _log "  ${DIM}╭─────────────────────────────────────────────${RESET}"
-    _log "  ${DIM}│${RESET} ${BOLD}target${RESET} ${GREEN}$TARGET_HOST${RESET}   ${BOLD}mode${RESET} ${MAGENTA}${SCOPE_MODE}${RESET}${pmode}"
-    _log "  ${DIM}╰─────────────────────────────────────────────${RESET}"
+    box "$DIM" "${BOLD}target${RESET} ${GREEN}$TARGET_HOST${RESET}   ${BOLD}mode${RESET} ${MAGENTA}${pmode}${RESET}"
     echo ""
-    echo -e "   ${CYAN}RECON${RESET}                         ${CYAN}CONTENT${RESET}"
-    echo -e "   ${BOLD}1${RESET}  Subdomain Enumeration      ${BOLD}5${RESET}  URL Collection"
-    echo -e "   ${BOLD}2${RESET}  HTTP Probe + WAF           ${BOLD}6${RESET}  JavaScript Recon"
-    echo -e "   ${BOLD}3${RESET}  Origin Discovery           ${BOLD}7${RESET}  Directory Bruteforce"
-    echo -e "   ${BOLD}4${RESET}  Port Scanning              ${BOLD}8${RESET}  Parameter Discovery"
+    echo -e "   ${CYAN}RECON${RESET}                              ${CYAN}CONTENT${RESET}"
+    echo -e "   $(_mk subdomains) ${BOLD}1${RESET}  Subdomain Enumeration    $(_mk urls)   ${BOLD}5${RESET}  URL Collection"
+    echo -e "   $(_mk http) ${BOLD}2${RESET}  HTTP Probe + WAF         $(_mk js)   ${BOLD}6${RESET}  JavaScript Recon"
+    echo -e "   $(_mk origin) ${BOLD}3${RESET}  Origin Discovery         $(_mk fuzz)   ${BOLD}7${RESET}  Directory Bruteforce"
+    echo -e "   $(_mk ports) ${BOLD}4${RESET}  Port Scanning            $(_mk params)   ${BOLD}8${RESET}  Parameter Discovery"
     echo ""
-    echo -e "   ${CYAN}VULN / OSINT${RESET}                  ${CYAN}ACTIONS${RESET}"
-    echo -e "   ${BOLD}9${RESET}  Vulnerability Scan         ${BOLD}F${RESET}  ${GREEN}Run Full Pipeline${RESET}"
-    echo -e "   ${BOLD}10${RESET} Google / GitHub Dorks      ${BOLD}R${RESET}  Generate Report"
-    echo -e "   ${BOLD}11${RESET} Cloud Bucket Recon         ${BOLD}Q${RESET}  Quit"
+    echo -e "   ${CYAN}VULN / OSINT${RESET}                       ${CYAN}ACTIONS${RESET}"
+    echo -e "   $(_mk nuclei) ${BOLD}9${RESET}  Vulnerability Scan       ${BOLD}F${RESET}  ${GREEN}Run Full Pipeline${RESET}"
+    echo -e "   $(_mk dorks) ${BOLD}10${RESET} Google / GitHub Dorks    ${BOLD}R${RESET}  Generate Report"
+    echo -e "   $(_mk cloud) ${BOLD}11${RESET} Cloud Bucket Recon       ${BOLD}Q${RESET}  Quit"
+    echo ""
+    echo -e "   ${DIM}✓ = already run this session${RESET}"
     echo ""
     read -rp "$(echo -e "  ${BOLD}tanya${RESET} ${GREEN}>${RESET} ")" choice
     echo ""
@@ -1026,9 +1161,10 @@ interactive_menu() {
       5) run_urls ;; 6) run_js ;; 7) run_fuzz ;; 8) run_params ;;
       9) run_nuclei ;; 10) run_dorks ;; 11) run_cloud ;;
       R) run_report ;;
-      F) run_full ;; Q) ok "Results in $OUT_DIR"; exit 0 ;;
-      *) warn "Invalid choice" ;;
+      F) run_full ;; Q) prune_empty "$OUT_DIR"; ok "Results in $OUT_DIR"; exit 0 ;;
+      *) warn "Invalid choice"; continue ;;
     esac
+    prune_empty "$OUT_DIR"          # tidy 0-byte files after every action
   done
 }
 
@@ -1101,11 +1237,10 @@ main() {
   touch "$STATE_FILE" "$LOG_FILE"
 
   check_deps
-  _log "  ${DIM}╭─ run ────────────────────────────────────────────────────────────────────────────────${RESET}"
-  _log "  ${DIM}│${RESET} target  ${GREEN}$TARGET_HOST${RESET}"
-  _log "  ${DIM}│${RESET} scope   $DOMAIN ${DIM}(mode: $SCOPE_MODE$([ "$PASSIVE" = true ] && echo ', passive'))${RESET}"
-  _log "  ${DIM}│${RESET} output  ${CYAN}$OUT_DIR${RESET}"
-  _log "  ${DIM}╰──────────────────────────────────────────────────────────────────────────────────────${RESET}"
+  box "$DIM" "${BOLD}RUN${RESET}" \
+    "target  ${GREEN}$TARGET_HOST${RESET}" \
+    "scope   $DOMAIN ${DIM}(mode: $SCOPE_MODE$([ "$PASSIVE" = true ] && echo ', passive'))${RESET}" \
+    "output  ${CYAN}$OUT_DIR${RESET}"
 
   case "${1:-}" in
     --full) run_full ;;
@@ -1117,7 +1252,8 @@ main() {
         fuzz) run_fuzz ;; params) run_params ;; nuclei) run_nuclei ;;
         dorks) run_dorks ;; cloud) run_cloud ;; report) run_report ;;
         *) die "Unknown module: $2" ;;
-      esac ;;
+      esac
+      prune_empty "$OUT_DIR" ;;
     "") interactive_menu ;;
     *) die "Unknown option: $1 — use --help" ;;
   esac

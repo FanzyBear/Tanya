@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  tanya.sh — Web Recon Pipeline v5.0 (txt/jsonl, no DB)
+#  tanya.sh — Web Recon Pipeline v5.3 (txt/jsonl, no DB)
 #
 #  Usage:
 #    ./tanya.sh <target> [options]
@@ -22,7 +22,8 @@ set -uo pipefail
 
 # ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; BOLD='\033[1m'; RESET='\033[0m'
+CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; BLUE='\033[0;34m'
+BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
 
 # ── Paths / globals ──────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,6 +46,13 @@ FFUF_THREADS=40
 FFUF_WORDLIST="$HOME/SecLists/Discovery/Web-Content/common.txt"
 CURL_UA="Mozilla/5.0 (recon; +tanya.sh)"
 
+# Optional API keys for origin discovery (set in config.env). Left blank = skipped.
+SECURITYTRAILS_API_KEY="${SECURITYTRAILS_API_KEY:-}"
+SHODAN_API_KEY="${SHODAN_API_KEY:-}"
+
+# Quiet mode — when true, noisy active modules are skipped (set via --passive).
+PASSIVE=false
+
 # Hosts on these providers are single apps, not enumerable apexes.
 PAAS_SUFFIXES=(
   herokuapp.com vercel.app netlify.app netlify.com pages.dev github.io
@@ -58,25 +66,33 @@ PAAS_SUFFIXES=(
 
 # ── Logging ──────────────────────────────────────────────────
 _log()    { echo -e "$*" | tee -a "${LOG_FILE:-/dev/null}"; }
-info()    { _log "${CYAN}[*]${RESET} $*"; }
-ok()      { _log "${GREEN}[+]${RESET} $*"; }
-warn()    { _log "${YELLOW}[!]${RESET} $*"; }
-err()     { _log "${RED}[x]${RESET} $*"; }
-section() { _log "\n${BOLD}${YELLOW}=== $* ===${RESET}"; }
+info()    { _log "${DIM}  ·${RESET} $*"; }
+ok()      { _log "  ${GREEN}✓${RESET} $*"; }
+warn()    { _log "  ${YELLOW}!${RESET} $*"; }
+err()     { _log "  ${RED}✗${RESET} $*"; }
+section() {
+  if [ "${STEP_TOTAL:-0}" -gt 0 ]; then
+    STEP_N=$(( STEP_N + 1 ))
+    _log "\n${BOLD}${BLUE}[${STEP_N}/${STEP_TOTAL}]${RESET} ${BOLD}${CYAN}$*${RESET}"
+  else
+    _log "\n${BOLD}${CYAN}▆▆▆${RESET} ${BOLD}$*${RESET}"
+  fi
+}
 die()     { err "$*"; exit 1; }
 
+# Pipeline progress state (set by run_full)
+STEP_N=0; STEP_TOTAL=0
+
 banner() {
-cat << 'EOF'
-
-  ████████╗ █████╗ ███╗   ██╗██╗   ██╗ █████╗
-     ██╔══╝██╔══██╗████╗  ██║╚██╗ ██╔╝██╔══██╗      _._     _,-'""`-._
-     ██║   ███████║██╔██╗ ██║ ╚████╔╝ ███████║     (,-.`._,'(       |\`-/|
-     ██║   ██╔══██║██║╚██╗██║  ╚██╔╝  ██╔══██║          `-.-' \ )-`( , o o)
-     ██║   ██║  ██║██║ ╚████║   ██║   ██║  ██║               `-    \`_`"'-
-     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝
-            Web Recon Pipeline v5.0
-
-EOF
+  _log ""
+  _log "${CYAN}  ████████╗ █████╗ ███╗   ██╗██╗   ██╗ █████╗${RESET}"
+  _log "${CYAN}     ██╔══╝██╔══██╗████╗  ██║╚██╗ ██╔╝██╔══██╗${RESET}    ${DIM}_._     _,-'\"\"\`-._${RESET}"
+  _log "${CYAN}     ██║   ███████║██╔██╗ ██║ ╚████╔╝ ███████║${RESET}   ${DIM}(,-.\`._,'(       |\\\`-/|${RESET}"
+  _log "${CYAN}     ██║   ██╔══██║██║╚██╗██║  ╚██╔╝  ██╔══██║${RESET}        ${DIM}\`-.-' \\ )-\`( , o o)${RESET}"
+  _log "${CYAN}     ██║   ██║  ██║██║ ╚████║   ██║   ██║  ██║${RESET}             ${DIM}\`-    \\\`_\`\"'-${RESET}"
+  _log "${CYAN}     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝${RESET}"
+  _log "        ${BOLD}Web Recon Pipeline${RESET} ${GREEN}v5.3${RESET}  ${DIM}— authorized targets only${RESET}"
+  _log ""
 }
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -111,11 +127,16 @@ retry() {
   done
 }
 
-# normalize a stream of hostnames: strip scheme/path/port, lowercase, drop wildcards & junk
+# Harvest hostnames from ANY tool output. We EXTRACT FQDNs from each line
+# rather than requiring the whole line to be a clean host — this is what lets
+# us recover names from verbose formats (e.g. amass graph lines like
+# "www.example.com (FQDN) --> a_record --> 1.2.3.4"). IPs/ASNs/netblocks are
+# naturally excluded because the regex requires a trailing alpha TLD.
 normalize_hosts() {
-  sed -E 's#^[a-zA-Z]+://##; s#/.*$##; s/:[0-9]+$//; s/^\*\.//' \
-    | tr '[:upper:]' '[:lower:]' \
-    | grep -E '^([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$' \
+  tr '[:upper:]' '[:lower:]' \
+    | sed -E 's#https?://##g' \
+    | grep -oE '([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9])?\.)+[a-z]{2,}' \
+    | sed -E 's/^\*\.//; s/\.$//' \
     | sort -u
 }
 
@@ -183,7 +204,7 @@ check_deps() {
   section "DEPENDENCY CHECK"
   local core=(curl jq)                      # pipeline relies on these
   local recommended=(subfinder httpx naabu nuclei katana ffuf)
-  local optional=(assetfinder amass waybackurls gau gowitness eyewitness \
+  local optional=(assetfinder amass waybackurls gau \
                   arjun trufflehog gitleaks s3scanner host nslookup nc)
   local missing_core=()
 
@@ -324,18 +345,208 @@ run_http_probe() {
   state_mark_done "http"
 }
 
+# ── MODULE 2b: Origin Discovery (CDN/WAF bypass) ─────────────
+# Goal: when the target hides behind a CDN (Cloudflare/Akamai/etc.), find the
+# real backend IP so later scanning hits the origin instead of the edge.
+# Method (all standard, mostly key-free):
+#   1. Resolve every in-scope host (+ MX hosts) to IPs.
+#   2. Pull historical/passive IPs (SecurityTrails, Shodan) if API keys are set.
+#   3. Classify each IP as CDN-edge vs non-CDN. Non-CDN IPs are origin candidates.
+#   4. Verify candidates: request the site directly on the candidate IP using the
+#      real Host/SNI (curl --resolve) and compare the response to the live baseline.
+run_origin() {
+  state_is_done "origin" && { info "Origin: done (resume)"; return 0; }
+  section "ORIGIN DISCOVERY (CDN BYPASS)"
+  local dir="$OUT_DIR/origin"
+  local subs="$OUT_DIR/subdomains/subs.txt"
+  mkdir -p "$dir"
+  nonempty "$subs" || { warn "No hosts — run subdomains first"; state_mark_done "origin"; return 0; }
+  need curl; need jq; need python3
+
+  local all="$dir/all_ips.txt"; : > "$all"
+
+  # 1. Resolve in-scope hosts → IPs (dnsx if present, else getent)
+  info "Resolving $(count "$subs") host(s) to IPs…"
+  if has dnsx; then
+    dnsx -l "$subs" -a -resp-only -silent 2>>"$LOG_FILE" | sort -u >> "$all" || true
+  else
+    while IFS= read -r h; do
+      getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}'
+    done < "$subs" | sort -u >> "$all"
+  fi
+
+  # 2. MX hosts often run on the origin / same hosting — resolve them too
+  info "Checking MX records…"
+  local mx_hosts
+  if has dig; then
+    mx_hosts=$(dig +short MX "$DOMAIN" 2>/dev/null | awk '{print $NF}' | sed 's/\.$//')
+  elif has host; then
+    mx_hosts=$(host -t MX "$DOMAIN" 2>/dev/null | awk '/mail is handled/{print $NF}' | sed 's/\.$//')
+  fi
+  if [ -n "${mx_hosts:-}" ]; then
+    echo "$mx_hosts" > "$dir/mx_hosts.txt"
+    while IFS= read -r mh; do
+      [ -z "$mh" ] && continue
+      getent ahostsv4 "$mh" 2>/dev/null | awk '{print $1}'
+    done <<< "$mx_hosts" >> "$all"
+  fi
+
+  # 3. Optional passive history sources (need API keys; silently skip if absent)
+  if [ -n "$SECURITYTRAILS_API_KEY" ]; then
+    info "SecurityTrails historical A records…"
+    curl -s --max-time 30 \
+      "https://api.securitytrails.com/v1/history/${DOMAIN}/dns/a?apikey=${SECURITYTRAILS_API_KEY}" \
+      2>>"$LOG_FILE" \
+      | jq -r '.records[]?.values[]?.ip' 2>/dev/null >> "$all" || warn "SecurityTrails query failed"
+  fi
+  if [ -n "$SHODAN_API_KEY" ]; then
+    info "Shodan DNS records…"
+    curl -s --max-time 30 \
+      "https://api.shodan.io/dns/domain/${DOMAIN}?key=${SHODAN_API_KEY}" \
+      2>>"$LOG_FILE" \
+      | jq -r '.data[]? | select(.type=="A") | .value' 2>/dev/null >> "$all" || warn "Shodan query failed"
+  fi
+
+  sort -u -o "$all" "$all"
+  local ip_total; ip_total=$(count "$all")
+  if [ "$ip_total" -eq 0 ]; then
+    warn "No IPs resolved — skipping origin discovery"
+    state_mark_done "origin"; return 0
+  fi
+  ok "Collected $ip_total unique IP(s) → $all"
+
+  # 4. Classify CDN vs non-CDN. cdncheck (ProjectDiscovery) is most accurate;
+  #    otherwise a built-in IP-in-CIDR test against major CDN ranges.
+  info "Classifying CDN edge vs origin candidates…"
+  python3 - "$all" "$dir/cdn_ips.txt" "$dir/origin_candidates.txt" <<'PYEOF'
+import sys, ipaddress
+# Major CDN / reverse-proxy edge ranges. Cloudflare is exhaustive (most common);
+# others are representative. Anything NOT in here is treated as an origin candidate.
+CDN_NETS = [
+  # Cloudflare IPv4 (official)
+  "173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22",
+  "141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20",
+  "197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13",
+  "104.24.0.0/14","172.64.0.0/13","131.0.72.0/22",
+  # Fastly (subset)
+  "151.101.0.0/16","199.232.0.0/16",
+  # Sucuri
+  "192.88.134.0/23","185.93.228.0/22","66.248.200.0/22",
+  # Incapsula / Imperva (subset)
+  "199.83.128.0/21","198.143.32.0/19","149.126.72.0/21","45.60.0.0/16",
+]
+nets = [ipaddress.ip_network(c) for c in CDN_NETS]
+cdn, origin = [], []
+for line in open(sys.argv[1]):
+    ip = line.strip()
+    if not ip: continue
+    try: a = ipaddress.ip_address(ip)
+    except ValueError: continue
+    (cdn if any(a in n for n in nets) else origin).append(ip)
+open(sys.argv[2],"w").write("\n".join(sorted(set(cdn))))
+open(sys.argv[3],"w").write("\n".join(sorted(set(origin))))
+PYEOF
+
+  # Bonus: if cdncheck exists, also subtract anything it flags as CDN/WAF/cloud
+  if has cdncheck; then
+    cdncheck -i "$dir/origin_candidates.txt" -silent 2>>"$LOG_FILE" > "$dir/_cdncheck_hits.txt" || true
+    if nonempty "$dir/_cdncheck_hits.txt"; then
+      grep -vxFf "$dir/_cdncheck_hits.txt" "$dir/origin_candidates.txt" \
+        > "$dir/_oc.tmp" 2>/dev/null && mv "$dir/_oc.tmp" "$dir/origin_candidates.txt" || true
+      cat "$dir/_cdncheck_hits.txt" >> "$dir/cdn_ips.txt"
+      sort -u -o "$dir/cdn_ips.txt" "$dir/cdn_ips.txt"
+    fi
+    rm -f "$dir/_cdncheck_hits.txt"
+  fi
+
+  local cdn_n cand_n
+  cdn_n=$(count "$dir/cdn_ips.txt"); cand_n=$(count "$dir/origin_candidates.txt")
+  ok "CDN edge IPs: $cdn_n | origin candidates: $cand_n"
+  if [ "$cdn_n" -gt 0 ] && [ "$cand_n" -eq 0 ]; then
+    warn "Target is fully behind a CDN and no direct-origin IP leaked — that's good hygiene on their side."
+  fi
+  [ "$cand_n" -eq 0 ] && { state_mark_done "origin"; return 0; }
+
+  if [ "$PASSIVE" = true ]; then
+    info "Passive mode — skipping active origin verification ($cand_n candidates saved)"
+    state_mark_done "origin"; return 0
+  fi
+
+  # 5. Verify candidates: hit the IP directly with the real Host/SNI and compare
+  #    to the live baseline (title first, content-length as fallback signal).
+  info "Verifying $cand_n candidate(s) against live baseline…"
+  local bhost="$TARGET_HOST" btitle="" blen=""
+  if [ -f "$OUT_DIR/http/alive.jsonl" ]; then
+    btitle=$(jq -r --arg h "$bhost" 'select((.input // "")==$h or ((.url // "")|test($h;"i"))) | .title // ""' \
+             "$OUT_DIR/http/alive.jsonl" 2>/dev/null | head -1)
+    blen=$(jq -r --arg h "$bhost" 'select((.input // "")==$h or ((.url // "")|test($h;"i"))) | .content_length // ""' \
+             "$OUT_DIR/http/alive.jsonl" 2>/dev/null | head -1)
+  fi
+  if [ -z "$btitle" ]; then
+    btitle=$(curl -sk --max-time 15 -A "$CURL_UA" "https://$bhost/" 2>/dev/null \
+             | grep -oiE '<title>[^<]*' | head -1 | sed -E 's/<title>//I')
+  fi
+  info "  baseline title: ${btitle:-<none>}"
+
+  : > "$dir/confirmed_origins.txt"
+  while IFS= read -r ip; do
+    [ -z "$ip" ] && continue
+    for scheme in https http; do
+      local port=443; [ "$scheme" = http ] && port=80
+      local body title
+      body=$(curl -sk --max-time 10 -A "$CURL_UA" \
+               --resolve "$bhost:$port:$ip" "$scheme://$bhost/" 2>/dev/null) || continue
+      [ -z "$body" ] && continue
+      title=$(printf '%s' "$body" | grep -oiE '<title>[^<]*' | head -1 | sed -E 's/<title>//I')
+      if [ -n "$btitle" ] && [ "$title" = "$btitle" ]; then
+        echo "$ip  [$scheme]  CONFIRMED (title match): $title" >> "$dir/confirmed_origins.txt"
+        echo "$ip" >> "$dir/origins.txt"
+        break
+      elif [ -n "$blen" ] && [ "${#body}" -gt 0 ]; then
+        local diff=$(( ${#body} - blen )); diff=${diff#-}
+        if [ "$diff" -lt 512 ]; then
+          echo "$ip  [$scheme]  likely (size ~match): len=${#body} vs baseline=$blen" >> "$dir/confirmed_origins.txt"
+          echo "$ip" >> "$dir/origins.txt"
+          break
+        fi
+      fi
+    done
+  done < "$dir/origin_candidates.txt"
+
+  [ -f "$dir/origins.txt" ] && sort -u -o "$dir/origins.txt" "$dir/origins.txt"
+  local conf_n; conf_n=$(count "$dir/confirmed_origins.txt")
+  if [ "$conf_n" -gt 0 ]; then
+    warn "Possible ORIGIN IP(s) found → $dir/confirmed_origins.txt"
+    warn "Later modules will also scan these directly (bypassing the CDN)."
+  else
+    ok "No origin confirmed (candidates saved for manual review → $dir/origin_candidates.txt)"
+  fi
+  state_mark_done "origin"
+}
+
 # ── MODULE 3: Port Scanning ──────────────────────────────────
 run_ports() {
   state_is_done "ports" && { info "Ports: done (resume)"; return 0; }
+  [ "$PASSIVE" = true ] && { section "PORT SCANNING"; info "skipped (passive mode)"; state_mark_done "ports"; return 0; }
   section "PORT SCANNING"
   local dir="$OUT_DIR/ports"
   local subs="$OUT_DIR/subdomains/subs.txt"
   mkdir -p "$dir"
   nonempty "$subs" || { warn "No hosts — run subdomains first"; return 0; }
 
+  # Build the scan target list: in-scope hosts + any confirmed origin IPs,
+  # so we hit the real backend rather than only the CDN edge.
+  local targets="$dir/scan_targets.txt"
+  cp "$subs" "$targets"
+  if [ -s "$OUT_DIR/origin/origins.txt" ]; then
+    cat "$OUT_DIR/origin/origins.txt" >> "$targets"
+    info "Including $(count "$OUT_DIR/origin/origins.txt") confirmed origin IP(s) in scan"
+  fi
+  sort -u -o "$targets" "$targets"
+
   if has naabu; then
     info "naabu top-1000 ports…"
-    retry 2 naabu -list "$subs" -top-ports 1000 -rate "$NAABU_RATE" \
+    retry 2 naabu -list "$targets" -top-ports 1000 -rate "$NAABU_RATE" \
       -c "$NAABU_THREADS" -silent -o "$dir/ports.txt" \
       || warn "naabu had issues — partial results possible"
   else
@@ -345,7 +556,7 @@ run_ports() {
       for p in 80 443 8080 8443 3000 5000 6379 9200 27017 2375 10250 9000; do
         nc -z -w 2 "$host" "$p" 2>/dev/null && echo "${host}:${p}" >> "$dir/ports.txt"
       done
-    done < "$subs"
+    done < "$targets"
   fi
 
   grep -E ':(2375|2376|6379|9200|9300|27017|28017|10250|4848|5900|7001|8888|9090|2379|5601)$' \
@@ -357,30 +568,6 @@ run_ports() {
   state_mark_done "ports"
 }
 
-# ── MODULE 4: Screenshots ────────────────────────────────────
-run_screenshots() {
-  state_is_done "screenshots" && { info "Screenshots: done (resume)"; return 0; }
-  section "SCREENSHOTS"
-  local urls="$OUT_DIR/http/live_urls.txt"
-  local dir="$OUT_DIR/screenshots"
-  mkdir -p "$dir"
-  nonempty "$urls" || { warn "No live URLs — run http first"; state_mark_done "screenshots"; return 0; }
-
-  if has gowitness; then
-    info "gowitness…"
-    run_tool gowitness gowitness scan file -f "$urls" \
-      --delay 2 --threads 8 --screenshot-path "$dir/" || true
-    ok "Screenshots → $dir/"
-  elif has eyewitness; then
-    run_tool eyewitness eyewitness --web -f "$urls" \
-      --timeout 10 --threads 8 -d "$dir/" || true
-    ok "Screenshots → $dir/"
-  else
-    warn "No screenshot tool (gowitness/eyewitness)"
-  fi
-  state_mark_done "screenshots"
-}
-
 # ── MODULE 5: URL Collection ─────────────────────────────────
 run_urls() {
   state_is_done "urls" && { info "URLs: done (resume)"; return 0; }
@@ -390,7 +577,7 @@ run_urls() {
   mkdir -p "$dir"
   touch "$dir/katana.txt" "$dir/wayback.txt" "$dir/gau.txt"
 
-  if has katana && nonempty "$alive"; then
+  if has katana && nonempty "$alive" && [ "$PASSIVE" != true ]; then
     info "katana crawl (depth $KATANA_DEPTH)…"
     run_tool katana katana -list "$alive" -jc -d "$KATANA_DEPTH" -silent \
       -o "$dir/katana.txt" || true
@@ -530,6 +717,7 @@ PYEOF
 # ── MODULE 7: Directory Bruteforce ───────────────────────────
 run_fuzz() {
   state_is_done "fuzz" && { info "Fuzz: done (resume)"; return 0; }
+  [ "$PASSIVE" = true ] && { section "DIRECTORY BRUTEFORCE"; info "skipped (passive mode)"; state_mark_done "fuzz"; return 0; }
   section "DIRECTORY BRUTEFORCE"
   local dir="$OUT_DIR/fuzz"
   local urls="$OUT_DIR/http/live_urls.txt"
@@ -561,7 +749,7 @@ run_params() {
   local alive="$OUT_DIR/http/live_urls.txt"
   mkdir -p "$dir"
 
-  if has arjun && nonempty "$alive"; then
+  if has arjun && nonempty "$alive" && [ "$PASSIVE" != true ]; then
     info "arjun…"
     run_tool arjun arjun -i "$alive" -oT "$dir/arjun.txt" --rate-limit 10 || true
     ok "arjun → $dir/arjun.txt"
@@ -593,6 +781,7 @@ run_params() {
 # ── MODULE 9: Vulnerability Scanning ─────────────────────────
 run_nuclei() {
   state_is_done "nuclei" && { info "Nuclei: done (resume)"; return 0; }
+  [ "$PASSIVE" = true ] && { section "VULNERABILITY SCANNING"; info "skipped (passive mode)"; state_mark_done "nuclei"; return 0; }
   section "VULNERABILITY SCANNING"
   local dir="$OUT_DIR/nuclei"
   local alive="$OUT_DIR/http/live_urls.txt"
@@ -600,18 +789,46 @@ run_nuclei() {
   nonempty "$alive" || { warn "No live URLs — run http first"; state_mark_done "nuclei"; return 0; }
   need nuclei
 
-  info "nuclei full scan (low→critical)…"
-  run_tool nuclei nuclei -l "$alive" -severity low,medium,high,critical -silent -o "$dir/nuclei.txt" || true
-  info "nuclei — CVEs…"
-  run_tool nuclei nuclei -l "$alive" -tags cves -silent -o "$dir/nuclei_cves.txt" || true
-  info "nuclei — exposures…"
-  run_tool nuclei nuclei -l "$alive" -tags exposures -silent -o "$dir/nuclei_exposures.txt" || true
-  info "nuclei — misconfig…"
-  run_tool nuclei nuclei -l "$alive" -tags misconfig -silent -o "$dir/nuclei_misconfig.txt" || true
+  # Templates must be present or scans fail with "no templates provided".
+  info "Syncing nuclei templates…"
+  nuclei -update-templates -silent >>"$LOG_FILE" 2>&1 \
+    || warn "template sync failed — continuing with whatever is installed"
 
-  local total; total=$(cat "$dir"/nuclei*.txt 2>/dev/null | sort -u | awk 'END{print NR+0}')
-  ok "Nuclei findings (unique): $total → $dir/"
-  [ "$total" -gt 0 ] && warn "Review $dir/"
+  # Two non-overlapping passes written to one combined file, then deduplicated.
+  # (The old per-tag 'cves' pass failed because the current template tag is
+  # 'cve', not 'cves'; CVEs are already covered by the severity pass anyway.)
+  local raw="$dir/_raw.txt"; : > "$raw"
+
+  info "nuclei — severity scan (low→critical)…"
+  run_tool nuclei nuclei -l "$alive" -severity low,medium,high,critical \
+    -silent -o "$dir/_sev.txt" && cat "$dir/_sev.txt" >> "$raw" 2>/dev/null || true
+
+  info "nuclei — exposures + misconfig…"
+  run_tool nuclei nuclei -l "$alive" -tags exposures,misconfig \
+    -silent -o "$dir/_exp.txt" && cat "$dir/_exp.txt" >> "$raw" 2>/dev/null || true
+
+  # Single authoritative, de-duplicated findings file
+  sort -u "$raw" > "$dir/findings.txt" 2>/dev/null || : > "$dir/findings.txt"
+  rm -f "$dir/_raw.txt" "$dir/_sev.txt" "$dir/_exp.txt"
+
+  # Categorize from the deduped source (no re-scanning, no duplicate lines)
+  grep -iE 'CVE-[0-9]{4}-[0-9]+'                  "$dir/findings.txt" > "$dir/cves.txt"        2>/dev/null || true
+  grep -iE 'exposure|exposed|disclosure|\.git|\.env|backup|listing' \
+                                                  "$dir/findings.txt" > "$dir/exposures.txt"   2>/dev/null || true
+  grep -iE 'misconfig|missing-security|security-headers|cors|default-' \
+                                                  "$dir/findings.txt" > "$dir/misconfig.txt"   2>/dev/null || true
+
+  local total crit high med low cve_n
+  total=$(count "$dir/findings.txt")
+  crit=$(grep -c '\[critical\]' "$dir/findings.txt" 2>/dev/null || echo 0)
+  high=$(grep -c '\[high\]'     "$dir/findings.txt" 2>/dev/null || echo 0)
+  med=$(grep -c '\[medium\]'    "$dir/findings.txt" 2>/dev/null || echo 0)
+  low=$(grep -c '\[low\]'       "$dir/findings.txt" 2>/dev/null || echo 0)
+  cve_n=$(count "$dir/cves.txt")
+
+  ok "Nuclei: $total unique finding(s) → $dir/findings.txt"
+  _log "      ${RED}critical:$crit${RESET}  ${MAGENTA}high:$high${RESET}  ${YELLOW}medium:$med${RESET}  ${CYAN}low:$low${RESET}  ${BOLD}CVEs:$cve_n${RESET}"
+  { [ "$crit" -gt 0 ] || [ "$high" -gt 0 ] || [ "$cve_n" -gt 0 ]; } && warn "High-signal findings present — review $dir/findings.txt"
   state_mark_done "nuclei"
 }
 
@@ -679,16 +896,21 @@ run_cloud() {
   ok "Generated $(count "$dir/bucket_names.txt") bucket permutations"
 
   if has s3scanner; then
-    info "s3scanner…"
-    run_tool s3scanner s3scanner scan --bucket-file "$dir/bucket_names.txt" \
-      --out-file "$dir/s3_results.txt" || true
-    grep -iE '(open|public|listable)' "$dir/s3_results.txt" \
-      > "$dir/open_buckets.txt" 2>/dev/null || true
-    local n; n=$(count "$dir/open_buckets.txt")
-    ok "Open/misconfigured buckets: $n"
-    [ "$n" -gt 0 ] && warn "→ $dir/open_buckets.txt"
+    info "s3scanner (Go CLI)…"
+    # Go s3scanner: single-dash flags, NO 'scan' subcommand, results go to stdout.
+    s3scanner -bucket-file "$dir/bucket_names.txt" -threads 8 \
+      > "$dir/s3_results.txt" 2>>"$LOG_FILE" || true
+
+    # Each printed line is an existing bucket; "AllUsers" => publicly accessible.
+    grep -iE 'allusers' "$dir/s3_results.txt" > "$dir/open_buckets.txt" 2>/dev/null || true
+
+    local exist_n open_n
+    exist_n=$(count "$dir/s3_results.txt")
+    open_n=$(count "$dir/open_buckets.txt")
+    ok "Buckets found: $exist_n | publicly exposed: $open_n → $dir/s3_results.txt"
+    [ "$open_n" -gt 0 ] && warn "Public buckets → $dir/open_buckets.txt"
   else
-    warn "s3scanner not found (pip install s3scanner) — names saved for manual check"
+    warn "s3scanner not found (go install github.com/sa7mon/s3scanner@latest) — names saved for manual check"
   fi
   state_mark_done "cloud"
 }
@@ -710,6 +932,8 @@ run_report() {
     printf "  %-22s %s\n" "In-scope hosts:"  "$(count "$OUT_DIR/subdomains/subs.txt")"
     printf "  %-22s %s\n" "Live URLs:"        "$(count "$OUT_DIR/http/live_urls.txt")"
     printf "  %-22s %s\n" "WAF detections:"   "$(count "$OUT_DIR/http/waf.txt")"
+    printf "  %-22s %s\n" "Origin candidates:" "$(count "$OUT_DIR/origin/origin_candidates.txt")"
+    printf "  %-22s %s\n" "Confirmed origins:" "$(count "$OUT_DIR/origin/origins.txt")"
     printf "  %-22s %s\n" "Open ports:"       "$(count "$OUT_DIR/ports/ports.txt")"
     printf "  %-22s %s\n" "Total URLs:"       "$(count "$OUT_DIR/urls/urls.txt")"
     printf "  %-22s %s\n" "JS endpoints:"     "$(count "$OUT_DIR/js/endpoints.txt")"
@@ -717,20 +941,21 @@ run_report() {
     printf "  %-22s %s\n" "Param URLs:"       "$(count "$OUT_DIR/params/parameterized.txt")"
     printf "  %-22s %s\n" "SSRF candidates:"  "$(count "$OUT_DIR/params/ssrf_params.txt")"
     printf "  %-22s %s\n" "Redirect cands:"   "$(count "$OUT_DIR/params/redirect_params.txt")"
-    printf "  %-22s %s\n" "Nuclei findings:"  "$(cat "$OUT_DIR/nuclei"/nuclei*.txt 2>/dev/null | sort -u | awk 'END{print NR+0}')"
+    printf "  %-22s %s\n" "Nuclei findings:"  "$(count "$OUT_DIR/nuclei/findings.txt")"
     echo ""
 
     _block() { [ "$(count "$2")" -gt 0 ] && { echo "-- $1"; head -"${3:-50}" "$2"; echo ""; }; }
     _block "WAF DETECTIONS"            "$OUT_DIR/http/waf.txt"
+    _block "CONFIRMED ORIGIN IPs"      "$OUT_DIR/origin/confirmed_origins.txt"
     _block "HIGH-RISK PORTS"           "$OUT_DIR/ports/high_interest.txt"
     _block "INTERESTING SERVICES"      "$OUT_DIR/http/interesting.txt"
     _block "SSRF CANDIDATES (top 20)"  "$OUT_DIR/params/ssrf_params.txt" 20
     _block "REDIRECT CANDIDATES (20)"  "$OUT_DIR/params/redirect_params.txt" 20
     _block "POTENTIAL SECRETS (20)"    "$OUT_DIR/js/potential_secrets.txt" 20
 
-    echo "-- OUTPUT FILES ------------------------"
+    echo "-- OUTPUT FILES (full paths) -----------"
     find "$OUT_DIR" -type f \( -name '*.txt' -o -name '*.jsonl' -o -name '*.json' \) \
-      | sort | sed "s|$OUT_DIR/||"
+      | sort
     echo ""
     echo "========================================"
   } | tee "$report"
@@ -739,12 +964,12 @@ run_report() {
 
 # ── Full pipeline ────────────────────────────────────────────
 run_full() {
-  section "FULL PIPELINE"
   local start=$SECONDS
+  STEP_TOTAL=12; STEP_N=0           # enables [n/12] progress in section()
   run_subdomains
   run_http_probe
+  run_origin
   run_ports
-  run_screenshots
   run_urls
   run_js
   run_fuzz
@@ -753,30 +978,54 @@ run_full() {
   run_dorks
   run_cloud
   run_report
-  ok "Pipeline complete in $(( SECONDS - start ))s → $OUT_DIR"
+  STEP_TOTAL=0
+  local elapsed=$(( SECONDS - start ))
+  local mm=$(( elapsed / 60 )) ss=$(( elapsed % 60 ))
+
+  # Completion box with headline numbers
+  local subs live nucl orig
+  subs=$(count "$OUT_DIR/subdomains/subs.txt")
+  live=$(count "$OUT_DIR/http/live_urls.txt")
+  orig=$(count "$OUT_DIR/origin/origins.txt")
+  nucl=$(count "$OUT_DIR/nuclei/findings.txt")
+  echo ""
+  _log "  ${GREEN}╔════════════════════════════════════════════${RESET}"
+  _log "  ${GREEN}║${RESET}  ${BOLD}${GREEN}SCAN COMPLETE${RESET}  ${DIM}$TARGET_HOST${RESET}"
+  _log "  ${GREEN}║${RESET}"
+  _log "  ${GREEN}║${RESET}  hosts ${BOLD}$subs${RESET}   live ${BOLD}$live${RESET}   origins ${BOLD}$orig${RESET}   nuclei ${BOLD}$nucl${RESET}"
+  _log "  ${GREEN}║${RESET}  elapsed ${BOLD}${mm}m ${ss}s${RESET}"
+  _log "  ${GREEN}╚════════════════════════════════════════════${RESET}"
+  _log "  ${DIM}→ output: $OUT_DIR${RESET}"
+  _log "  ${DIM}→ report: $OUT_DIR/report/report.txt${RESET}"
 }
 
 # ── Interactive menu ─────────────────────────────────────────
 interactive_menu() {
   while true; do
+    local pmode=""; [ "$PASSIVE" = true ] && pmode="  ${MAGENTA}· passive${RESET}"
     echo ""
-    echo -e "  ${BOLD}Target:${RESET} ${GREEN}$TARGET_HOST${RESET}  ${BOLD}Mode:${RESET} ${MAGENTA}$SCOPE_MODE${RESET}"
-    echo -e "  ${BOLD}Output:${RESET} ${CYAN}$OUT_DIR${RESET}"
+    _log "  ${DIM}╭─────────────────────────────────────────────${RESET}"
+    _log "  ${DIM}│${RESET} ${BOLD}target${RESET} ${GREEN}$TARGET_HOST${RESET}   ${BOLD}mode${RESET} ${MAGENTA}${SCOPE_MODE}${RESET}${pmode}"
+    _log "  ${DIM}╰─────────────────────────────────────────────${RESET}"
     echo ""
-    echo -e "  ${BOLD}[1]${RESET}  Subdomains / Seed     ${BOLD}[7]${RESET}  Directory Bruteforce"
-    echo -e "  ${BOLD}[2]${RESET}  HTTP Probe + WAF      ${BOLD}[8]${RESET}  Parameter Discovery"
-    echo -e "  ${BOLD}[3]${RESET}  Port Scanning         ${BOLD}[9]${RESET}  Vuln Scanning (nuclei)"
-    echo -e "  ${BOLD}[4]${RESET}  Screenshots           ${BOLD}[10]${RESET} Dorks"
-    echo -e "  ${BOLD}[5]${RESET}  URL Collection        ${BOLD}[11]${RESET} Cloud Buckets"
-    echo -e "  ${BOLD}[6]${RESET}  JavaScript Recon      ${BOLD}[R]${RESET}  Report"
-    echo -e "  ${BOLD}[F]${RESET}  Run Full Pipeline     ${BOLD}[Q]${RESET}  Quit"
+    echo -e "   ${CYAN}RECON${RESET}                         ${CYAN}CONTENT${RESET}"
+    echo -e "   ${BOLD}1${RESET}  Subdomain Enumeration      ${BOLD}5${RESET}  URL Collection"
+    echo -e "   ${BOLD}2${RESET}  HTTP Probe + WAF           ${BOLD}6${RESET}  JavaScript Recon"
+    echo -e "   ${BOLD}3${RESET}  Origin Discovery           ${BOLD}7${RESET}  Directory Bruteforce"
+    echo -e "   ${BOLD}4${RESET}  Port Scanning              ${BOLD}8${RESET}  Parameter Discovery"
     echo ""
-    read -rp "$(echo -e "${BOLD}  > ${RESET}")" choice
+    echo -e "   ${CYAN}VULN / OSINT${RESET}                  ${CYAN}ACTIONS${RESET}"
+    echo -e "   ${BOLD}9${RESET}  Vulnerability Scan         ${BOLD}F${RESET}  ${GREEN}Run Full Pipeline${RESET}"
+    echo -e "   ${BOLD}10${RESET} Google / GitHub Dorks      ${BOLD}R${RESET}  Generate Report"
+    echo -e "   ${BOLD}11${RESET} Cloud Bucket Recon         ${BOLD}Q${RESET}  Quit"
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}tanya${RESET} ${GREEN}>${RESET} ")" choice
+    echo ""
     case "${choice^^}" in
-      1) run_subdomains ;; 2) run_http_probe ;; 3) run_ports ;;
-      4) run_screenshots ;; 5) run_urls ;; 6) run_js ;;
-      7) run_fuzz ;; 8) run_params ;; 9) run_nuclei ;;
-      10) run_dorks ;; 11) run_cloud ;; R) run_report ;;
+      1) run_subdomains ;; 2) run_http_probe ;; 3) run_origin ;; 4) run_ports ;;
+      5) run_urls ;; 6) run_js ;; 7) run_fuzz ;; 8) run_params ;;
+      9) run_nuclei ;; 10) run_dorks ;; 11) run_cloud ;;
+      R) run_report ;;
       F) run_full ;; Q) ok "Results in $OUT_DIR"; exit 0 ;;
       *) warn "Invalid choice" ;;
     esac
@@ -801,10 +1050,12 @@ $(echo -e "${BOLD}Options:${RESET}")
   --module <name>     Run one module
   --single            Force single-host mode (skip subdomain enum)
   --apex              Force apex mode (do subdomain enum)
+  --passive           Quiet mode: skip noisy active scans
+                      (ports, fuzz, nuclei, crawling, origin verification)
   --help              This help
 
 $(echo -e "${BOLD}Modules:${RESET}")
-  subdomains http ports screenshots urls js fuzz params nuclei dorks cloud report
+  subdomains http origin ports urls js fuzz params nuclei dorks cloud report
 
 EOF
   exit 0
@@ -812,6 +1063,7 @@ EOF
 
 # ── Entry point ──────────────────────────────────────────────
 main() {
+  [ -t 1 ] && clear 2>/dev/null || true
   banner
   [ $# -eq 0 ] && usage
   [[ "$1" == "--help" || "$1" == "-h" ]] && usage
@@ -824,6 +1076,7 @@ main() {
     case "$1" in
       --single) SCOPE_MODE="single" ;;
       --apex)   SCOPE_MODE="apex" ;;
+      --passive) PASSIVE=true ;;
       *) args+=("$1") ;;
     esac
     shift
@@ -848,17 +1101,19 @@ main() {
   touch "$STATE_FILE" "$LOG_FILE"
 
   check_deps
-  info "Target : $TARGET_HOST"
-  info "Scope  : $DOMAIN  (mode: $SCOPE_MODE)"
-  info "Output : $OUT_DIR"
+  _log "  ${DIM}╭─ run ────────────────────────────────────────────────────────────────────────────────${RESET}"
+  _log "  ${DIM}│${RESET} target  ${GREEN}$TARGET_HOST${RESET}"
+  _log "  ${DIM}│${RESET} scope   $DOMAIN ${DIM}(mode: $SCOPE_MODE$([ "$PASSIVE" = true ] && echo ', passive'))${RESET}"
+  _log "  ${DIM}│${RESET} output  ${CYAN}$OUT_DIR${RESET}"
+  _log "  ${DIM}╰──────────────────────────────────────────────────────────────────────────────────────${RESET}"
 
   case "${1:-}" in
     --full) run_full ;;
     --module)
       [ -z "${2:-}" ] && die "Specify a module name"
       case "$2" in
-        subdomains) run_subdomains ;; http) run_http_probe ;; ports) run_ports ;;
-        screenshots) run_screenshots ;; urls) run_urls ;; js) run_js ;;
+        subdomains) run_subdomains ;; http) run_http_probe ;; origin) run_origin ;; ports) run_ports ;;
+        urls) run_urls ;; js) run_js ;;
         fuzz) run_fuzz ;; params) run_params ;; nuclei) run_nuclei ;;
         dorks) run_dorks ;; cloud) run_cloud ;; report) run_report ;;
         *) die "Unknown module: $2" ;;

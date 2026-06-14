@@ -1,19 +1,53 @@
 #!/usr/bin/env python3
 # ============================================================
-#  tanya_report.py — interactive HTML report for tanya.sh
+#  tanya_report.py — interactive HTML report for tanya.sh  (v5.5)
 #
 #  Walks a tanya.sh run directory and emits ONE self-contained
 #  .html file (no external assets, works offline / air-gapped /
 #  emailed to a client). Mirrors the triage logic in run_report.
 #
+#  v5.5: surfaces WSL Windows paths (\\wsl.localhost\...) + a clickable
+#  file:// URL, and an "edge challenges" (Cloudflare/anti-bot) section.
+#
 #  Usage:
 #    python3 tanya_report.py <OUT_DIR> [--out report.html]
 #                            [--target host] [--scope apex|single]
-#                            [--passive]
+#                            [--passive] [--win-dir '\\wsl.localhost\...']
 #
 #  Exit codes: 0 ok, 2 bad/empty dir.
 # ============================================================
-import os, sys, json, html, re, argparse, datetime
+import os, sys, json, html, re, argparse, datetime, subprocess, shutil
+
+# ---- WSL path helpers ---------------------------------------------------
+def detect_wsl():
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        with open("/proc/version", encoding="utf-8", errors="replace") as f:
+            return bool(re.search(r"microsoft|wsl", f.read(), re.I))
+    except OSError:
+        return False
+
+def to_win_path(linux_path):
+    """Linux path -> Windows path via wslpath; echoes input back on failure."""
+    if not shutil.which("wslpath"):
+        return linux_path
+    try:
+        return subprocess.run(["wslpath", "-w", linux_path],
+                              capture_output=True, text=True, timeout=5
+                              ).stdout.strip() or linux_path
+    except Exception:
+        return linux_path
+
+def win_file_url(win_path):
+    """Windows path -> file:// URL openable from a Windows browser."""
+    if not win_path:
+        return ""
+    w = win_path.replace("\\", "/")
+    if w.startswith("//"):          # UNC \\wsl.localhost\...
+        return "file://" + w[2:]
+    return "file:///" + w           # drive C:\...
+
 
 # ---- tiny IO helpers ----------------------------------------------------
 def lines(path):
@@ -78,6 +112,21 @@ def parse_ports(d):
 def parse_origins(d):
     return lines(os.path.join(d, "origin", "confirmed_origins.txt"))
 
+def parse_challenges(d):
+    """http/challenge_detail.txt rows: url \t code \t verdict \t vendor.
+    Return only the rows actually behind a challenge."""
+    rows = []
+    for ln in lines(os.path.join(d, "http", "challenge_detail.txt")):
+        parts = ln.split("\t")
+        if len(parts) < 4:
+            continue
+        url, code, verdict, vendor = parts[0], parts[1], parts[2], parts[3]
+        if verdict.strip().lower() != "challenge":
+            continue
+        rows.append({"url": url, "code": code, "vendor": vendor})
+    rows.sort(key=lambda r: (r["vendor"], r["url"]))
+    return rows
+
 def state_modules(d):
     done = set(lines(os.path.join(d, ".state")))
     order = ["subdomains","http","origin","ports","urls","js","fuzz","params","nuclei","dorks","cloud"]
@@ -106,22 +155,37 @@ def build_triage(d):
     ]
     return [{"tier": t, "n": c, "label": lbl, "path": p} for (t, c, lbl, p) in items if c > 0]
 
-def collect(d, target, scope, passive):
+def collect(d, target, scope, passive, win_dir=None):
     nf = os.path.join(d, "nuclei", "findings.txt")
     sev_counts = {s: sum(1 for l in lines(nf) if f"[{s}]" in l.lower())
                   for s in ["critical","high","medium","low","info"]}
+    abs_d = os.path.abspath(d)
+    # Windows-side paths (WSL): use the value tanya.sh computed if it passed one,
+    # else derive it here. Empty when not on WSL.
+    win = win_dir or (to_win_path(abs_d) if detect_wsl() else "")
+    win_report = ""
+    file_url = ""
+    if win:
+        sep = "" if win.endswith("\\") else "\\"
+        win_report = f"{win}{sep}report\\report.html"
+        file_url = win_file_url(win_report)
+    challenges = parse_challenges(d)
     return {
         "target": target,
         "scope": scope,
         "passive": passive,
         "generated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "out_dir": os.path.abspath(d),
+        "out_dir": abs_d,
+        "win_dir": win,
+        "win_report": win_report,
+        "file_url": file_url,
         "modules": state_modules(d),
         "triage": build_triage(d),
         "summary": {
             "hosts":   count(os.path.join(d,"subdomains","subs.txt")),
             "live":    count(os.path.join(d,"http","live_urls.txt")),
             "waf":     count(os.path.join(d,"http","waf.txt")),
+            "challenged": count(os.path.join(d,"http","challenged.txt")),
             "orig_c":  count(os.path.join(d,"origin","origin_candidates.txt")),
             "origins": count(os.path.join(d,"origin","origins.txt")),
             "ports":   count(os.path.join(d,"ports","ports.txt")),
@@ -137,6 +201,8 @@ def collect(d, target, scope, passive):
         "findings": parse_findings(d),
         "ports":    parse_ports(d),
         "origins":  parse_origins(d),
+        "challenges": challenges,
+        "challenged": lines(os.path.join(d,"http","challenged.txt")),
         "hosts":    lines(os.path.join(d,"subdomains","subs.txt")),
         "secrets":  lines(os.path.join(d,"js","potential_secrets.txt")),
         "endpoints":lines(os.path.join(d,"js","endpoints.txt")),
@@ -224,6 +290,14 @@ a:hover{text-decoration:underline}
   border:1px solid var(--line);border-radius:6px;padding:4px 9px;background:var(--panel)}
 .pip .led{width:7px;height:7px;border-radius:99px;background:var(--faint)}
 .pip.on{color:var(--ink)} .pip.on .led{background:var(--amber);box-shadow:0 0 7px var(--amber)}
+
+/* WSL path strip */
+.wslbar{margin:10px 0 0;display:flex;gap:9px;align-items:center;flex-wrap:wrap;
+  background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:8px 12px;font-size:11.5px;color:var(--dim)}
+.wslbar .wk{color:var(--amber);font-weight:700;letter-spacing:.14em;font-size:10px;
+  border:1px solid #3a3318;border-radius:5px;padding:1px 7px}
+.wslbar code{color:var(--ink);word-break:break-all}
 
 /* summary cards */
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:10px;margin:22px 0}
@@ -359,6 +433,14 @@ const rib=E('div','ribbon');
 rib.innerHTML=D.modules.map(m=>`<span class="pip ${m.done?'on':''}"><span class="led"></span>${m.name}</span>`).join('');
 wrap.appendChild(rib);
 
+// WSL path strip — Windows-side dir + clickable file:// report link
+if(D.win_dir){
+  const ws=E('div','wslbar');
+  const link=D.file_url?` · <a href="${esc(D.file_url)}">open report in Windows browser ↗</a>`:'';
+  ws.innerHTML=`<span class="wk">WSL</span><code>${esc(D.win_dir)}</code>${link}`;
+  wrap.appendChild(ws);
+}
+
 // triage list (full, filterable by search)
 if(D.triage.length){
   const sec=section('00','Triage queue',D.triage.length,'triage');
@@ -380,6 +462,7 @@ const s=D.summary;
 const cards=E('div','cards');
 const cardDefs=[
   ['hosts','in-scope hosts',''],['live','live services',''],
+  ['challenged','edge-challenged',s.challenged>0?'acc':''],
   ['findings','nuclei findings',s.sev.critical+s.sev.high>0?'warn':''],
   ['secrets','secret hits',s.secrets>0?'alert':''],
   ['buckets','public buckets',s.buckets>0?'alert':''],
@@ -422,17 +505,29 @@ wrap.appendChild(cards);
 }
 
 // live services table
+const CHSET=new Set(D.challenged||[]);
 tableSection('02','Live services',D.alive,'alive',rows=>{
   const t=E('table','tbl');
   t.innerHTML=rows.map(a=>{
     const sc=String(a.code)[0];
     const cls=sc==='2'?'s2':sc==='3'?'s3':sc==='4'?'s4':sc==='5'?'s5':'';
     const tech=a.tech.map(x=>`<span class="chip">${esc(x)}</span>`).join('');
-    return `<tr class="searchable" data-text="${esc((a.url+' '+a.title+' '+a.tech.join(' ')).toLowerCase())}">
+    const chl=CHSET.has(a.url)?'<span class="chip" style="color:var(--amber);border-color:#3a3318">edge-challenged</span>':'';
+    return `<tr class="searchable" data-text="${esc((a.url+' '+a.title+' '+a.tech.join(' ')+(CHSET.has(a.url)?' challenged':'')).toLowerCase())}">
       <td style="width:64px"><span class="scode ${cls}">${esc(a.code)}</span></td>
       <td><a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.url)}</a><div style="color:var(--dim);margin-top:2px">${esc(a.title)}</div></td>
-      <td style="width:38%">${tech}</td></tr>`;
+      <td style="width:38%">${tech}${chl}</td></tr>`;
   }).join('');
+  return t;
+});
+
+// edge challenges (Cloudflare / anti-bot)
+tableSection('02b','Edge challenges (WAF / anti-bot)',D.challenges,'challenges',rows=>{
+  const t=E('table','tbl');
+  t.innerHTML=rows.map(c=>`<tr class="searchable" data-text="${esc((c.url+' '+c.vendor+' '+c.code).toLowerCase())}">
+    <td><a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.url)}</a></td>
+    <td style="width:70px"><span class="scode s4">${esc(c.code)}</span></td>
+    <td style="width:150px"><span class="chip" style="color:var(--amber);border-color:#3a3318">${esc(c.vendor)}</span></td></tr>`).join('');
   return t;
 });
 
@@ -499,8 +594,11 @@ listSection('10','Interesting file URLs',D.interesting_files,'intfiles');
 }
 
 // footer
+const winFoot = D.file_url
+  ? `<br>windows: ${esc(D.win_dir)} · <a href="${esc(D.file_url)}">open report in Windows browser</a>`
+  : "";
 wrap.appendChild(E('div','foot',
-  `generated ${esc(D.generated)} · ${esc(D.out_dir)}<br>
+  `generated ${esc(D.generated)} · ${esc(D.out_dir)}${winFoot}<br>
    <span class="auth">authorized targets only</span> — recon output is signal, not proof. verify every finding manually.`));
 
 /* ---- section builders ---- */
@@ -568,6 +666,8 @@ def main():
     ap.add_argument("--target", default=None)
     ap.add_argument("--scope", default="apex")
     ap.add_argument("--passive", action="store_true")
+    ap.add_argument("--win-dir", default=None,
+                    help="Windows-side path of OUT_DIR (WSL); auto-detected if omitted")
     a = ap.parse_args()
 
     d = a.out_dir.rstrip("/")
@@ -579,7 +679,7 @@ def main():
         base = os.path.basename(d)
         target = re.sub(r"_\d{8}_\d{6}$", "", base) or base
 
-    data = collect(d, target, a.scope, a.passive)
+    data = collect(d, target, a.scope, a.passive, win_dir=a.win_dir)
     out = a.out or os.path.join(d, "report", "report.html")
     out_parent = os.path.dirname(out)
     if out_parent:

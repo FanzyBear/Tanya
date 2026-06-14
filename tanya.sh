@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================
-#  tanya.sh — Web Recon Pipeline v5.4 (txt/jsonl, no DB)
+#  tanya.sh — Web Recon Pipeline v5.5 (txt/jsonl, no DB)
+#
+#  v5.5 changes:
+#    · WSL-aware: report + completion box now print Windows-accessible
+#      paths (\\wsl.localhost\...) and a clickable file:// URL so you can
+#      open the HTML report straight from a Windows browser/Explorer.
+#    · edge anti-bot / challenge detection (Cloudflare "Just a moment",
+#      Akamai, Imperva/Incapsula, DataDome, PerimeterX, AWS WAF, generic
+#      CAPTCHA gates). Challenged hosts are split out so they don't poison
+#      the main nuclei/fuzz/crawl passes; clean hosts are scanned normally.
+#    · nuclei is now CDN-aware: it scans the directly-reachable ("clean")
+#      URLs + any CONFIRMED ORIGIN IPs (real backend, edge bypassed), with a
+#      realistic browser UA and polite rate limits so it trips fewer WAFs.
+#      Challenged hosts get a separate slow best-effort pass.
+#    · clean log file: ANSI colour codes are stripped from recon.log.
+#    · hardier modules: missing recommended tools now skip gracefully
+#      instead of killing the whole run; LC_ALL=C for stable sort/grep.
 #
 #  v5.4 changes:
 #    · empty output files are pruned automatically (no more 0-byte clutter)
@@ -26,6 +42,7 @@
 # ============================================================
 
 set -uo pipefail
+export LC_ALL=C LANG=C    # deterministic sort/grep, ASCII-safe (domains are ASCII)
 
 # ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -53,6 +70,18 @@ FFUF_THREADS=40
 FFUF_WORDLIST="$HOME/SecLists/Discovery/Web-Content/common.txt"
 CURL_UA="Mozilla/5.0 (recon; +tanya.sh)"
 
+# Realistic browser UA — used for edge-challenge detection and the gentle
+# nuclei pass over challenged hosts (helps a few checks land where a recon UA
+# would be blocked outright). Not an evasion tool; just looks like a browser.
+BROWSER_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+# nuclei tuning — keep it polite so we don't trip rate limits / get banned.
+NUCLEI_RATE=150       # max requests/sec (-rl)
+NUCLEI_CONC=25        # template concurrency (-c)
+NUCLEI_RETRIES=1
+NUCLEI_TIMEOUT=10
+CHALLENGE_THREADS=15  # parallelism for edge-challenge detection
+
 # Optional API keys for origin discovery (set in config.env). Left blank = skipped.
 SECURITYTRAILS_API_KEY="${SECURITYTRAILS_API_KEY:-}"
 SHODAN_API_KEY="${SHODAN_API_KEY:-}"
@@ -72,7 +101,15 @@ PAAS_SUFFIXES=(
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
 # ── Logging ──────────────────────────────────────────────────
-_log()    { echo -e "$*" | tee -a "${LOG_FILE:-/dev/null}"; }
+# Render colour to the terminal, but write a clean (ANSI-stripped) copy to the
+# log file so recon.log stays grep-friendly and email-safe.
+_log() {
+  local rendered; rendered=$(echo -e "$*")
+  printf '%s\n' "$rendered"
+  if [ -n "${LOG_FILE:-}" ]; then
+    printf '%s\n' "$rendered" | sed -E $'s/\x1b\\[[0-9;]*m//g' >> "$LOG_FILE"
+  fi
+}
 info()    { _log "${DIM}  ·${RESET} $*"; }
 ok()      { _log "  ${GREEN}✓${RESET} $*"; }
 warn()    { _log "  ${YELLOW}!${RESET} $*"; }
@@ -98,7 +135,7 @@ banner() {
   _log "${CYAN}     ██║   ██╔══██║██║╚██╗██║  ╚██╔╝  ██╔══██║${RESET}        ${DIM}\`-.-' \\ )-\`( , o o)${RESET}"
   _log "${CYAN}     ██║   ██║  ██║██║ ╚████║   ██║   ██║  ██║${RESET}             ${DIM}\`-    \\\`_\`\"'-${RESET}"
   _log "${CYAN}     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝${RESET}"
-  _log "        ${BOLD}Web Recon Pipeline${RESET} ${GREEN}v5.4${RESET}  ${DIM}— authorized targets only${RESET}"
+  _log "        ${BOLD}Web Recon Pipeline${RESET} ${GREEN}v5.5${RESET}  ${DIM}— authorized targets only${RESET}"
   _log ""
 }
 
@@ -111,6 +148,38 @@ count() { if [ -f "$1" ]; then awk 'END{print NR+0}' "$1" 2>/dev/null; else echo
 
 # Non-empty file?
 nonempty() { [ -s "$1" ]; }
+
+# Best URL list for active scanning: prefer the edge-"clean" list produced by
+# classify_challenges (hosts NOT sitting behind an active anti-bot challenge),
+# falling back to the full live list when classification didn't run or found
+# nothing to drop. Echoes a path; empty string if neither exists.
+scan_url_list() {
+  local clean="$OUT_DIR/http/clean_urls.txt"
+  local live="$OUT_DIR/http/live_urls.txt"
+  if nonempty "$clean"; then printf '%s' "$clean"
+  elif nonempty "$live"; then printf '%s' "$live"
+  else printf ''; fi
+}
+
+# ── WSL awareness ────────────────────────────────────────────
+# When running under WSL, Linux paths like /home/you/... aren't directly
+# usable from a Windows browser/Explorer. These helpers translate to the
+# Windows form (\\wsl.localhost\Distro\...) and a file:// URL.
+is_wsl() {
+  [ -n "${WSL_DISTRO_NAME:-}" ] && return 0
+  grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null
+}
+# Linux path -> Windows path (best effort; echoes input back if it can't).
+win_path() {
+  if has wslpath; then wslpath -w "$1" 2>/dev/null || printf '%s' "$1"
+  else printf '%s' "$1"; fi
+}
+# Linux path -> file:// URL openable from a Windows browser.
+win_file_url() {
+  local w; w=$(win_path "$1"); w=${w//\\//}     # backslashes -> forward slashes
+  if [[ "$w" == //* ]]; then printf 'file://%s' "${w#//}"   # UNC: \\wsl.localhost\..
+  else printf 'file:///%s' "$w"; fi                          # drive: C:\..
+}
 
 # Visible length of a string, ignoring our literal \033[...m color codes.
 # (Color vars hold the *text* "\033[..m"; echo -e renders them, so we strip
@@ -258,7 +327,8 @@ check_deps() {
   local core=(curl jq)                      # pipeline relies on these
   local recommended=(subfinder httpx naabu nuclei katana ffuf)
   local optional=(assetfinder amass waybackurls gau \
-                  arjun trufflehog gitleaks s3scanner host nslookup nc)
+                  arjun trufflehog gitleaks s3scanner \
+                  dnsx dig cdncheck host nslookup nc)
   local missing_core=()
 
   printf "  ${BOLD}%-14s %s${RESET}\n" "TOOL" "STATUS"
@@ -348,7 +418,8 @@ run_http_probe() {
   mkdir -p "$dir"
 
   nonempty "$subs" || { warn "No hosts to probe — run subdomains first"; return 0; }
-  need httpx; need jq
+  has httpx || { warn "httpx not installed — cannot probe HTTP, skipping"; state_mark_done "http"; return 0; }
+  need jq
 
   info "httpx on $(count "$subs") host(s), threads=$HTTPX_THREADS…"
   retry 2 httpx \
@@ -395,7 +466,80 @@ run_http_probe() {
     warn "nuclei unavailable — skipping WAF detection"
   fi
 
+  # Split live hosts into clean vs edge-challenged (Cloudflare/Akamai/etc.)
+  classify_challenges
+
   state_mark_done "http"
+}
+
+# ── Edge anti-bot / challenge detection ──────────────────────
+# Detects challenge interstitials served by a CDN/WAF EDGE — Cloudflare
+# "Just a moment…", Akamai, Imperva/Incapsula, DataDome, PerimeterX, AWS WAF,
+# and generic CAPTCHA gates. This is *detection + routing*, NOT a bypass: hosts
+# behind an active challenge are flagged so the operator knows that scanning the
+# edge is noisy/useless and that the real target is the ORIGIN (run_origin) or
+# authenticated/manual testing. Downstream modules (nuclei/fuzz/crawl) then use
+# the "clean" list so they don't waste requests or trip rate limits.
+classify_challenges() {
+  local dir="$OUT_DIR/http"
+  local live="$dir/live_urls.txt"
+  nonempty "$live" || return 0
+  has curl || { warn "curl missing — skipping challenge detection"; cp "$live" "$dir/clean_urls.txt" 2>/dev/null; return 0; }
+
+  info "Edge challenge / anti-bot detection on $(count "$live") URL(s)…"
+  local detail="$dir/challenge_detail.txt"; : > "$detail"
+
+  export BROWSER_UA
+  # one bounded request per URL; capture status + headers + a small body slice,
+  # then signature-match. Parallel + short timeouts keep this fast.
+  cat "$live" | xargs -P "$CHALLENGE_THREADS" -I{} bash -c '
+    url="$1"
+    td=$(mktemp -d) || exit 0
+    code=$(curl -sk -A "$BROWSER_UA" --compressed --max-time 8 \
+                -o "$td/b" -D "$td/h" -w "%{http_code}" "$url" 2>/dev/null) || code=000
+    blob=$(cat "$td/h" 2>/dev/null; head -c 60000 "$td/b" 2>/dev/null)
+    rm -rf "$td"
+    low=$(printf "%s" "$blob" | tr "[:upper:]" "[:lower:]")
+    vendor="na"; verdict="clean"
+    if printf "%s" "$low" | grep -qE "cf-mitigated: ?challenge|just a moment|challenge-platform|cdn-cgi/challenge|challenges\.cloudflare\.com|__cf_chl|cf_chl_|enable javascript and cookies to continue"; then
+      vendor="cloudflare"; verdict="challenge"
+    elif printf "%s" "$low" | grep -qE "x-iinfo|incap_ses|incapsula|_incapsula_|imperva"; then
+      vendor="imperva"; verdict="challenge"
+    elif printf "%s" "$low" | grep -qE "x-datadome|datadome"; then
+      vendor="datadome"; verdict="challenge"
+    elif printf "%s" "$low" | grep -qE "px-captcha|_pxhd|perimeterx|human challenge"; then
+      vendor="perimeterx"; verdict="challenge"
+    elif printf "%s" "$low" | grep -qE "awswafintegration|token\.awswaf|aws-waf-token"; then
+      vendor="awswaf"; verdict="challenge"
+    elif printf "%s" "$low" | grep -qE "akamaighost" && printf "%s" "$low" | grep -qE "access denied|reference #[0-9a-f]"; then
+      vendor="akamai"; verdict="challenge"
+    elif [ "$code" = "403" ] || [ "$code" = "429" ] || [ "$code" = "503" ]; then
+      if printf "%s" "$low" | grep -qE "captcha|are you (a )?human|verify you are (a )?human|attention required|bot detection|access denied"; then
+        vendor="generic"; verdict="challenge"
+      fi
+    fi
+    printf "%s\t%s\t%s\t%s\n" "$url" "$code" "$verdict" "$vendor"
+  ' _ {} >> "$detail" 2>/dev/null || true
+
+  awk -F"\t" '$3=="challenge"{print $1}' "$detail" 2>/dev/null | sort -u > "$dir/challenged.txt"
+  if nonempty "$dir/challenged.txt"; then
+    grep -vxFf "$dir/challenged.txt" "$live" | sort -u > "$dir/clean_urls.txt"
+  else
+    cp "$live" "$dir/clean_urls.txt"
+  fi
+
+  local ch; ch=$(count "$dir/challenged.txt")
+  if [ "$ch" -gt 0 ]; then
+    local vlist
+    vlist=$(awk -F"\t" '$3=="challenge"{print $4}' "$detail" 2>/dev/null \
+            | sort | uniq -c | sort -rn | awk '{printf "%s(%s) ", $2,$1}')
+    warn "$ch host(s) behind an active edge challenge → $dir/challenged.txt"
+    warn "  vendors: ${vlist:-n/a}"
+    warn "  edge scanning these is noisy/blocked — prefer the ORIGIN (origin module) or authenticated/manual testing."
+    ok   "Directly-scannable (clean) URLs: $(count "$dir/clean_urls.txt") → $dir/clean_urls.txt"
+  else
+    ok "No edge challenges detected — all $(count "$dir/clean_urls.txt") live URL(s) directly scannable"
+  fi
 }
 
 # ── MODULE 2b: Origin Discovery (CDN/WAF bypass) ─────────────
@@ -626,13 +770,14 @@ run_urls() {
   state_is_done "urls" && { info "URLs: done (resume)"; return 0; }
   section "URL COLLECTION"
   local dir="$OUT_DIR/urls"
-  local alive="$OUT_DIR/http/live_urls.txt"
+  local alive; alive="$(scan_url_list)"
   mkdir -p "$dir"
   touch "$dir/katana.txt" "$dir/wayback.txt" "$dir/gau.txt"
 
   if has katana && nonempty "$alive" && [ "$PASSIVE" != true ]; then
     info "katana crawl (depth $KATANA_DEPTH)…"
     run_tool katana katana -list "$alive" -jc -d "$KATANA_DEPTH" -silent \
+      -H "User-Agent: $BROWSER_UA" -rl "$NUCLEI_RATE" \
       -o "$dir/katana.txt" || true
   fi
   if has waybackurls; then
@@ -773,10 +918,10 @@ run_fuzz() {
   [ "$PASSIVE" = true ] && { section "DIRECTORY BRUTEFORCE"; info "skipped (passive mode)"; state_mark_done "fuzz"; return 0; }
   section "DIRECTORY BRUTEFORCE"
   local dir="$OUT_DIR/fuzz"
-  local urls="$OUT_DIR/http/live_urls.txt"
+  local urls; urls="$(scan_url_list)"
   mkdir -p "$dir"
   nonempty "$urls" || { warn "No live URLs — run http first"; state_mark_done "fuzz"; return 0; }
-  need ffuf
+  has ffuf || { warn "ffuf not installed — skipping directory bruteforce"; state_mark_done "fuzz"; return 0; }
 
   if [ ! -f "$FFUF_WORDLIST" ]; then
     warn "Wordlist missing: $FFUF_WORDLIST — set FFUF_WORDLIST in config.env"
@@ -785,8 +930,10 @@ run_fuzz() {
 
   info "ffuf against $(count "$urls") target(s)…"
   while IFS= read -r url; do
+    [ -z "$url" ] && continue
     local safe; safe=$(echo "$url" | sed 's|[:/?#]|_|g')
     ffuf -u "${url}/FUZZ" -w "$FFUF_WORDLIST" -ac -t "$FFUF_THREADS" -s \
+      -H "User-Agent: $BROWSER_UA" -rate "$NUCLEI_RATE" \
       -o "$dir/${safe}.json" -of json 2>>"$LOG_FILE" || true
   done < "$urls"
   ok "ffuf complete → $dir/"
@@ -799,7 +946,7 @@ run_params() {
   section "PARAMETER DISCOVERY"
   local dir="$OUT_DIR/params"
   local urls_file="$OUT_DIR/urls/urls.txt"
-  local alive="$OUT_DIR/http/live_urls.txt"
+  local alive; alive="$(scan_url_list)"
   mkdir -p "$dir"
 
   if has arjun && nonempty "$alive" && [ "$PASSIVE" != true ]; then
@@ -837,32 +984,77 @@ run_nuclei() {
   [ "$PASSIVE" = true ] && { section "VULNERABILITY SCANNING"; info "skipped (passive mode)"; state_mark_done "nuclei"; return 0; }
   section "VULNERABILITY SCANNING"
   local dir="$OUT_DIR/nuclei"
-  local alive="$OUT_DIR/http/live_urls.txt"
   mkdir -p "$dir"
-  nonempty "$alive" || { warn "No live URLs — run http first"; state_mark_done "nuclei"; return 0; }
-  need nuclei
+  has nuclei || { warn "nuclei not installed — skipping vuln scan"; state_mark_done "nuclei"; return 0; }
+
+  # ── Target selection ───────────────────────────────────────
+  # Primary target = the edge-"clean" URL list (hosts NOT behind an active
+  # anti-bot challenge) + any CONFIRMED origin IPs. Scanning the Cloudflare/
+  # DataDome/etc. edge of a challenged host just burns requests on a JS/CAPTCHA
+  # interstitial and trips rate limits, so those go through a separate, gentle
+  # pass below instead.
+  local primary="$dir/_targets.txt"; : > "$primary"
+  local base; base="$(scan_url_list)"
+  [ -n "$base" ] && cat "$base" >> "$primary"
+
+  # Add confirmed origins (scheme-prefixed) so we hit the real backend directly.
+  if [ -s "$OUT_DIR/origin/origins.txt" ]; then
+    while IFS= read -r oip; do
+      [ -z "$oip" ] && continue
+      printf 'https://%s\nhttp://%s\n' "$oip" "$oip"
+    done < "$OUT_DIR/origin/origins.txt" >> "$primary"
+    info "Including $(count "$OUT_DIR/origin/origins.txt") confirmed origin IP(s) (direct, CDN-bypassed)"
+  fi
+  sort -u -o "$primary" "$primary"
+
+  local challenged="$OUT_DIR/http/challenged.txt"
+  if [ ! -s "$primary" ] && [ ! -s "$challenged" ]; then
+    warn "No live URLs — run http first"; rm -f "$primary"; state_mark_done "nuclei"; return 0
+  fi
 
   # Templates must be present or scans fail with "no templates provided".
   info "Syncing nuclei templates…"
   nuclei -update-templates -silent >>"$LOG_FILE" 2>&1 \
     || warn "template sync failed — continuing with whatever is installed"
 
-  # Two non-overlapping passes written to one combined file, then deduplicated.
-  # (The old per-tag 'cves' pass failed because the current template tag is
-  # 'cve', not 'cves'; CVEs are already covered by the severity pass anyway.)
+  # ── Polite/robust flags shared by every pass ───────────────
+  # Real-browser UA (some edges block the default nuclei UA outright), bounded
+  # rate + concurrency, a retry, a per-request timeout, and -no-stdin so the
+  # tool never blocks waiting on a TTY inside the pipeline.
+  local common=( -H "User-Agent: $BROWSER_UA"
+                 -rl "$NUCLEI_RATE" -c "$NUCLEI_CONC"
+                 -retries "$NUCLEI_RETRIES" -timeout "$NUCLEI_TIMEOUT"
+                 -no-stdin -silent )
+
   local raw="$dir/_raw.txt"; : > "$raw"
 
-  info "nuclei — severity scan (low→critical)…"
-  run_tool nuclei nuclei -l "$alive" -severity low,medium,high,critical \
-    -silent -o "$dir/_sev.txt" && cat "$dir/_sev.txt" >> "$raw" 2>/dev/null || true
+  if [ -s "$primary" ]; then
+    info "nuclei — severity scan (low→critical) on $(count "$primary") target(s)…"
+    run_tool nuclei nuclei -l "$primary" -severity low,medium,high,critical \
+      "${common[@]}" -o "$dir/_sev.txt" && cat "$dir/_sev.txt" >> "$raw" 2>/dev/null || true
 
-  info "nuclei — exposures + misconfig…"
-  run_tool nuclei nuclei -l "$alive" -tags exposures,misconfig \
-    -silent -o "$dir/_exp.txt" && cat "$dir/_exp.txt" >> "$raw" 2>/dev/null || true
+    info "nuclei — exposures + misconfig…"
+    run_tool nuclei nuclei -l "$primary" -tags exposures,misconfig \
+      "${common[@]}" -o "$dir/_exp.txt" && cat "$dir/_exp.txt" >> "$raw" 2>/dev/null || true
+  fi
+
+  # ── Gentle pass over edge-challenged hosts ─────────────────
+  # We still look — but slowly and quietly. A challenge interstitial usually
+  # blocks template matches, yet some findings (TLS, headers, info disclosures
+  # served before the JS gate) still land. Heavily reduced rate/concurrency so
+  # we don't hammer an edge that's already rate-limiting us.
+  if [ -s "$challenged" ]; then
+    info "nuclei — gentle pass on $(count "$challenged") edge-challenged host(s) (reduced rate)…"
+    run_tool nuclei nuclei -l "$challenged" -severity medium,high,critical \
+      -H "User-Agent: $BROWSER_UA" -rl 20 -c 5 \
+      -retries "$NUCLEI_RETRIES" -timeout "$NUCLEI_TIMEOUT" -no-stdin -silent \
+      -o "$dir/_chl.txt" && cat "$dir/_chl.txt" >> "$raw" 2>/dev/null || true
+    warn "challenged hosts scanned gently — edge anti-bot may suppress results; prefer origin/manual."
+  fi
 
   # Single authoritative, de-duplicated findings file
   sort -u "$raw" > "$dir/findings.txt" 2>/dev/null || : > "$dir/findings.txt"
-  rm -f "$dir/_raw.txt" "$dir/_sev.txt" "$dir/_exp.txt"
+  rm -f "$dir/_raw.txt" "$dir/_sev.txt" "$dir/_exp.txt" "$dir/_chl.txt" "$primary"
 
   # Categorize from the deduped source (no re-scanning, no duplicate lines)
   grep -iE 'CVE-[0-9]{4}-[0-9]+'                  "$dir/findings.txt" > "$dir/cves.txt"        2>/dev/null || true
@@ -976,10 +1168,20 @@ run_html_report() {
   need python3
   local out="$OUT_DIR/report/report.html"
   local pass=(); [ "$PASSIVE" = true ] && pass=(--passive)
+  # On WSL, hand the generator the Windows-side path so the report can show a
+  # path/URL that actually opens from a Windows browser or Explorer.
+  local winargs=()
+  if is_wsl; then winargs=(--win-dir "$(win_path "$OUT_DIR")"); fi
   if python3 "$gen" "$OUT_DIR" --target "$TARGET_HOST" --scope "$SCOPE_MODE" \
-       "${pass[@]}" --out "$out" >>"$LOG_FILE" 2>&1; then
+       "${pass[@]}" "${winargs[@]}" --out "$out" >>"$LOG_FILE" 2>&1; then
     ok "Interactive report → $out"
-    info "open it in a browser: file://$out"
+    if is_wsl; then
+      local furl; furl="$(win_file_url "$out")"
+      info "open in Windows browser: ${CYAN}${furl}${RESET}"
+      info "or in Explorer: ${CYAN}$(win_path "$OUT_DIR/report")${RESET}"
+    else
+      info "open it in a browser: file://$out"
+    fi
   else
     warn "HTML report generation failed (see log)"
   fi
@@ -1005,10 +1207,11 @@ run_report() {
   local report="$dir/report.txt"
 
   # ---- gather counts once ----
-  local subs live waf orig_c orig openb sec intsvc hiport
+  local subs live waf chlng orig_c orig openb sec intsvc hiport
   subs=$(count "$OUT_DIR/subdomains/subs.txt")
   live=$(count "$OUT_DIR/http/live_urls.txt")
   waf=$(count "$OUT_DIR/http/waf.txt")
+  chlng=$(count "$OUT_DIR/http/challenged.txt")
   orig_c=$(count "$OUT_DIR/origin/origin_candidates.txt")
   orig=$(count "$OUT_DIR/origin/origins.txt")
   openb=$(count "$OUT_DIR/cloud/open_buckets.txt")
@@ -1058,6 +1261,10 @@ run_report() {
     echo "  scope mode : $SCOPE_MODE$([ "$PASSIVE" = true ] && echo '  (passive)')"
     echo "  generated  : $(date '+%Y-%m-%d %H:%M:%S')"
     echo "  output dir : $OUT_DIR"
+    if is_wsl; then
+      echo "  windows dir: $(win_path "$OUT_DIR")"
+      echo "  report url : $(win_file_url "$dir/report.html")"
+    fi
     echo "════════════════════════════════════════════════════════"
     echo ""
 
@@ -1094,6 +1301,7 @@ run_report() {
     printf "  %-22s %s\n" "In-scope hosts:"   "$subs"
     printf "  %-22s %s\n" "Live URLs:"         "$live"
     printf "  %-22s %s\n" "WAF detections:"    "$waf"
+    printf "  %-22s %s\n" "Edge-challenged:"   "$chlng"
     printf "  %-22s %s\n" "Origin candidates:" "$orig_c"
     printf "  %-22s %s\n" "Confirmed origins:" "$orig"
     printf "  %-22s %s\n" "Open ports:"        "$(count "$OUT_DIR/ports/ports.txt")"
@@ -1108,6 +1316,8 @@ run_report() {
 
     _block() { [ "$(count "$2")" -gt 0 ] && { echo "── $1"; head -"${3:-50}" "$2"; echo ""; }; }
     _block "WAF DETECTIONS"            "$OUT_DIR/http/waf.txt"
+    _block "EDGE-CHALLENGED HOSTS (anti-bot — prefer origin/manual)" \
+                                       "$OUT_DIR/http/challenged.txt"
     _block "CONFIRMED ORIGIN IPs"      "$OUT_DIR/origin/confirmed_origins.txt"
     _block "PUBLIC CLOUD BUCKETS"      "$OUT_DIR/cloud/open_buckets.txt"
     _block "HIGH-RISK PORTS"           "$OUT_DIR/ports/high_interest.txt"
@@ -1150,16 +1360,22 @@ run_full() {
   local mm=$(( elapsed / 60 )) ss=$(( elapsed % 60 ))
 
   # Completion box with headline numbers
-  local subs live nucl orig
+  local subs live nucl orig chlng
   subs=$(count "$OUT_DIR/subdomains/subs.txt")
   live=$(count "$OUT_DIR/http/live_urls.txt")
   orig=$(count "$OUT_DIR/origin/origins.txt")
   nucl=$(count "$OUT_DIR/nuclei/findings.txt")
+  chlng=$(count "$OUT_DIR/http/challenged.txt")
   echo ""
-  box "$GREEN" "${BOLD}${GREEN}SCAN COMPLETE${RESET}  ${DIM}$TARGET_HOST${RESET}" \
-    "hosts ${BOLD}$subs${RESET}   live ${BOLD}$live${RESET}   origins ${BOLD}$orig${RESET}   nuclei ${BOLD}$nucl${RESET}" \
-    "elapsed ${BOLD}${mm}m ${ss}s${RESET}" \
+  local -a boxlines=(
+    "hosts ${BOLD}$subs${RESET}   live ${BOLD}$live${RESET}   challenged ${BOLD}$chlng${RESET}   origins ${BOLD}$orig${RESET}   nuclei ${BOLD}$nucl${RESET}"
+    "elapsed ${BOLD}${mm}m ${ss}s${RESET}"
     "report  ${CYAN}$OUT_DIR/report/report.txt${RESET}"
+  )
+  if is_wsl; then
+    boxlines+=( "html    ${CYAN}$(win_file_url "$OUT_DIR/report/report.html")${RESET}" )
+  fi
+  box "$GREEN" "${BOLD}${GREEN}SCAN COMPLETE${RESET}  ${DIM}$TARGET_HOST${RESET}" "${boxlines[@]}"
   _log "  ${DIM}→ open the report above — it lists where to start.${RESET}"
 }
 
@@ -1268,10 +1484,15 @@ main() {
   touch "$STATE_FILE" "$LOG_FILE"
 
   check_deps
-  box "$DIM" "${BOLD}RUN${RESET}" \
-    "target  ${GREEN}$TARGET_HOST${RESET}" \
-    "scope   $DOMAIN ${DIM}(mode: $SCOPE_MODE$([ "$PASSIVE" = true ] && echo ', passive'))${RESET}" \
+  local -a runlines=(
+    "target  ${GREEN}$TARGET_HOST${RESET}"
+    "scope   $DOMAIN ${DIM}(mode: $SCOPE_MODE$([ "$PASSIVE" = true ] && echo ', passive'))${RESET}"
     "output  ${CYAN}$OUT_DIR${RESET}"
+  )
+  if is_wsl; then
+    runlines+=( "windir  ${CYAN}$(win_path "$OUT_DIR")${RESET}  ${DIM}(WSL)${RESET}" )
+  fi
+  box "$DIM" "${BOLD}RUN${RESET}" "${runlines[@]}"
 
   case "${1:-}" in
     --full) run_full ;;

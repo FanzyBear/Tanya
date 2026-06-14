@@ -968,6 +968,34 @@ run_cloud() {
   state_mark_done "cloud"
 }
 
+# ── MODULE 12: Interactive HTML Report ───────────────────────
+run_html_report() {
+  section "INTERACTIVE HTML REPORT"
+  local gen="$SCRIPT_DIR/tanya_report.py"
+  [ -f "$gen" ] || { warn "tanya_report.py not found beside tanya.sh — skipping"; return 0; }
+  need python3
+  local out="$OUT_DIR/report/report.html"
+  local pass=(); [ "$PASSIVE" = true ] && pass=(--passive)
+  if python3 "$gen" "$OUT_DIR" --target "$TARGET_HOST" --scope "$SCOPE_MODE" \
+       "${pass[@]}" --out "$out" >>"$LOG_FILE" 2>&1; then
+    ok "Interactive report → $out"
+    info "open it in a browser: file://$out"
+  else
+    warn "HTML report generation failed (see log)"
+  fi
+}
+
+_MULTI_SUFFIXES=" co.uk org.uk gov.uk ac.uk com.au net.au org.au com.br \
+co.nz com.mx co.jp co.in co.za com.sg com.tr co.id com.cn "
+registrable_apex() {
+  local h="$1"; is_ip "$h" && { echo "$h"; return; }
+  local labels n; IFS='.' read -ra labels <<< "$h"; n=${#labels[@]}
+  (( n <= 2 )) && { echo "$h"; return; }
+  local last2="${labels[n-2]}.${labels[n-1]}"
+  if [[ " $_MULTI_SUFFIXES " == *" $last2 "* ]]; then echo "${labels[n-3]}.${last2}"
+  else echo "$last2"; fi
+}
+
 # ── Report ───────────────────────────────────────────────────
 run_report() {
   prune_empty "$OUT_DIR"            # clean 0-byte files before we list anything
@@ -1115,6 +1143,7 @@ run_full() {
   run_dorks
   run_cloud
   run_report
+  run_html_report  
   STEP_TOTAL=0
   prune_empty "$OUT_DIR"            # final sweep of any 0-byte files
   local elapsed=$(( SECONDS - start ))
@@ -1160,7 +1189,7 @@ interactive_menu() {
       1) run_subdomains ;; 2) run_http_probe ;; 3) run_origin ;; 4) run_ports ;;
       5) run_urls ;; 6) run_js ;; 7) run_fuzz ;; 8) run_params ;;
       9) run_nuclei ;; 10) run_dorks ;; 11) run_cloud ;;
-      R) run_report ;;
+      R) run_report ;; H) run_html_report ;;
       F) run_full ;; Q) prune_empty "$OUT_DIR"; ok "Results in $OUT_DIR"; exit 0 ;;
       *) warn "Invalid choice"; continue ;;
     esac
@@ -1211,7 +1240,8 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --single) SCOPE_MODE="single" ;;
-      --apex)   SCOPE_MODE="apex" ;;
+      --apex)   SCOPE_MODE="apex"; DOMAIN="$(registrable_apex "$TARGET_HOST")"
+                [ "$DOMAIN" != "$TARGET_HOST" ] && info "Apex scope: $DOMAIN" ;;
       --passive) PASSIVE=true ;;
       *) args+=("$1") ;;
     esac
@@ -1234,6 +1264,7 @@ main() {
   mkdir -p "$OUT_DIR"
   LOG_FILE="$OUT_DIR/recon.log"
   STATE_FILE="$OUT_DIR/.state"
+  trap 'echo; warn "Interrupted — pruning + saving state"; prune_empty "$OUT_DIR" 2>/dev/null; exit 130' INT TERM
   touch "$STATE_FILE" "$LOG_FILE"
 
   check_deps
@@ -1251,6 +1282,7 @@ main() {
         urls) run_urls ;; js) run_js ;;
         fuzz) run_fuzz ;; params) run_params ;; nuclei) run_nuclei ;;
         dorks) run_dorks ;; cloud) run_cloud ;; report) run_report ;;
+        html) run_html_report ;;     
         *) die "Unknown module: $2" ;;
       esac
       prune_empty "$OUT_DIR" ;;

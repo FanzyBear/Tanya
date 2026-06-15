@@ -328,7 +328,8 @@ check_deps() {
   local recommended=(subfinder httpx naabu nuclei katana ffuf)
   local optional=(assetfinder amass waybackurls gau \
                   arjun trufflehog gitleaks s3scanner \
-                  dnsx dig cdncheck host nslookup nc)
+                  dnsx dig cdncheck host nslookup nc openssl \
+                  subzy dalfox gf puredns chaos)
   local missing_core=()
 
   printf "  ${BOLD}%-14s %s${RESET}\n" "TOOL" "STATUS"
@@ -1198,6 +1199,257 @@ registrable_apex() {
   else echo "$last2"; fi
 }
 
+# ── MODULE 15: Security Header Audit ─────────────────────────
+run_headers() {
+  state_is_done "headers" && { info "Headers: done (resume)"; return 0; }
+  section "SECURITY HEADER AUDIT"
+  local dir="$OUT_DIR/headers"
+  mkdir -p "$dir"
+
+  local clean="$OUT_DIR/http/clean_urls.txt"
+  nonempty "$clean" || { warn "No clean URLs — run HTTP probe first"; state_mark_done "headers"; return 0; }
+
+  # 1. Nuclei security-header templates
+  if has nuclei; then
+    spin_start "nuclei: security headers…"
+    nuclei -l "$clean" \
+      -t "http/miscellaneous/security-headers.yaml" \
+      -t "http/technologies/hsts-missing.yaml" \
+      -t "http/vulnerabilities/generic/crlf-injection.yaml" \
+      -silent -o "$dir/nuclei_headers.txt" \
+      -rate-limit "$NUCLEI_RATE" -concurrency "$NUCLEI_CONC" \
+      2>>"$LOG_FILE" || true
+    spin_stop
+    ok "nuclei headers: $(count "$dir/nuclei_headers.txt") finding(s)"
+  fi
+
+  # 2. Per-URL header snapshot (curl -I)
+  info "capturing response headers for $(count "$clean" | head -1) URL(s)…"
+  local hdr_dir="$dir/raw_headers"; mkdir -p "$hdr_dir"
+  while IFS= read -r url; do
+    local slug; slug=$(printf '%s' "$url" | tr -dc 'a-zA-Z0-9._-' | cut -c1-80)
+    curl -skI --max-time 10 -A "$BROWSER_UA" "$url" \
+      2>/dev/null > "$hdr_dir/${slug}.txt" || true
+  done < <(head -100 "$clean")
+  ok "header snapshots: $(find "$hdr_dir" -maxdepth 1 -name '*.txt' 2>/dev/null | wc -l) file(s)"
+
+  # 3. Host-header injection probe
+  info "probing host-header injection…"
+  local inject_out="$dir/host_injection.txt"; : > "$inject_out"
+  local rnd; rnd=$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c8 || echo "xrndx8")
+  local fake_host="${rnd}.tanya-probe.invalid"
+
+  while IFS= read -r url; do
+    local body
+    body=$(curl -sk --max-time 8 -A "$BROWSER_UA" \
+      -H "Host: $fake_host" \
+      -H "X-Forwarded-Host: $fake_host" \
+      -H "X-Host: $fake_host" \
+      "$url" 2>/dev/null || true)
+    if echo "$body" | grep -qF "$fake_host" 2>/dev/null; then
+      echo "$url  |  HOST_REFLECTION: $fake_host" >> "$inject_out"
+    fi
+  done < <(head -60 "$clean")
+
+  ok "host-header injection: $(count "$inject_out") potential(s)"
+
+  # 4. CORS misconfiguration deep-check
+  info "CORS deep-check (Origin: null + wildcard)…"
+  local cors_out="$dir/cors_issues.txt"; : > "$cors_out"
+  while IFS= read -r url; do
+    local hdr
+    hdr=$(curl -skI --max-time 8 -A "$BROWSER_UA" \
+      -H "Origin: null" "$url" 2>/dev/null || true)
+    if echo "$hdr" | grep -qi "access-control-allow-origin: null\|access-control-allow-origin: \*" 2>/dev/null; then
+      echo "$url  |  ACAO: null" >> "$cors_out"
+    fi
+    hdr=$(curl -skI --max-time 8 -A "$BROWSER_UA" \
+      -H "Origin: https://evil.tanya-probe.invalid" "$url" 2>/dev/null || true)
+    if echo "$hdr" | grep -qi "access-control-allow-origin: https://evil" 2>/dev/null; then
+      local cred; cred=$(echo "$hdr" | grep -i "access-control-allow-credentials" || true)
+      echo "$url  |  ACAO reflected  |  $cred" >> "$cors_out"
+    fi
+  done < <(head -60 "$clean")
+  ok "CORS deep: $(count "$cors_out") issue(s)"
+
+  state_mark_done "headers"
+  prune_empty "$dir"
+}
+
+# ── MODULE 16: GraphQL Recon ──────────────────────────────────
+run_graphql() {
+  state_is_done "graphql" && { info "GraphQL: done (resume)"; return 0; }
+  section "GRAPHQL RECON"
+  local dir="$OUT_DIR/graphql"
+  mkdir -p "$dir"
+
+  local clean="$OUT_DIR/http/clean_urls.txt"
+  nonempty "$clean" || { warn "No clean URLs — run HTTP probe first"; state_mark_done "graphql"; return 0; }
+
+  # 1. Endpoint discovery
+  local gql_paths=(/graphql /api/graphql /graphiql /v1/graphql /api/v1/graphql
+                   /query /gql /graph /graphql/console /playground /graphql/v1
+                   /api/graph /graphql/explorer /graphql/api /graph/query)
+
+  info "probing $(count "$clean") base URL(s) × ${#gql_paths[@]} paths…"
+  local ep_out="$dir/endpoints.txt"; : > "$ep_out"
+
+  while IFS= read -r base; do
+    local b="${base%/}"
+    for path in "${gql_paths[@]}"; do
+      local ep="${b}${path}"
+      local code
+      code=$(curl -sk -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -A "$BROWSER_UA" -d '{"query":"{ __typename }"}' \
+        --max-time 8 "$ep" 2>/dev/null || echo "000")
+      if [[ "$code" =~ ^(200|400|422)$ ]]; then
+        echo "$ep" >> "$ep_out"
+      fi
+    done
+  done < "$clean"
+  sort -u -o "$ep_out" "$ep_out" 2>/dev/null || true
+  ok "GraphQL endpoints discovered: $(count "$ep_out")"
+
+  # 2. Introspection check
+  if nonempty "$ep_out"; then
+    local intro_out="$dir/introspection_enabled.txt"; : > "$intro_out"
+    local batch_out="$dir/batch_allowed.txt"; : > "$batch_out"
+
+    while IFS= read -r ep; do
+      local resp
+      resp=$(curl -sk -X POST "$ep" -A "$BROWSER_UA" \
+        -H "Content-Type: application/json" \
+        -d '{"query":"{ __schema { queryType { name } } }"}' \
+        --max-time 10 2>/dev/null || true)
+      if echo "$resp" | grep -q '"queryType"' 2>/dev/null; then
+        echo "$ep" >> "$intro_out"
+        ok "  introspection ENABLED: $ep"
+        # Extract type names
+        echo "$resp" | grep -oE '"name":"[^"]+"' | sort -u \
+          >> "$dir/schema_types.txt" 2>/dev/null || true
+      fi
+
+      # Batch query test
+      resp=$(curl -sk -X POST "$ep" -A "$BROWSER_UA" \
+        -H "Content-Type: application/json" \
+        -d '[{"query":"{ __typename }"},{"query":"{ __typename }"}]' \
+        --max-time 8 2>/dev/null || true)
+      if echo "$resp" | grep -q '"data"' 2>/dev/null; then
+        echo "$ep" >> "$batch_out"
+      fi
+
+    done < "$ep_out"
+    ok "introspection enabled: $(count "$intro_out") · batch allowed: $(count "$batch_out")"
+
+    # 3. Nuclei GraphQL templates
+    if has nuclei; then
+      spin_start "nuclei: GraphQL security checks…"
+      nuclei -l "$ep_out" \
+        -tags graphql \
+        -silent -o "$dir/nuclei_graphql.txt" \
+        -rate-limit "$NUCLEI_RATE" -concurrency "$NUCLEI_CONC" \
+        2>>"$LOG_FILE" || true
+      spin_stop
+      ok "nuclei GraphQL: $(count "$dir/nuclei_graphql.txt") finding(s)"
+    fi
+  fi
+
+  state_mark_done "graphql"
+  prune_empty "$dir"
+}
+
+# ── MODULE 17: TLS / SSL Analysis ────────────────────────────
+run_ssl() {
+  state_is_done "ssl" && { info "SSL/TLS: done (resume)"; return 0; }
+  section "TLS / SSL ANALYSIS"
+  local dir="$OUT_DIR/ssl"
+  mkdir -p "$dir"
+
+  local live="$OUT_DIR/http/live_urls.txt"
+  nonempty "$live" || { warn "No live URLs — run HTTP probe first"; state_mark_done "ssl"; return 0; }
+
+  # Extract unique HTTPS hosts (host:port)
+  grep -E "^https://" "$live" 2>/dev/null \
+    | grep -oE 'https://[^/]+' \
+    | sed 's|https://||' \
+    | sort -u > "$dir/https_hosts.txt" || true
+
+  nonempty "$dir/https_hosts.txt" || {
+    info "No HTTPS hosts — nothing to check"
+    state_mark_done "ssl"; return 0
+  }
+  ok "checking TLS on $(count "$dir/https_hosts.txt") host(s)"
+
+  local issues="$dir/issues.txt"; : > "$issues"
+  local certs="$dir/cert_info.txt";  : > "$certs"
+
+  while IFS= read -r hostport; do
+    local host="${hostport%%:*}"
+    local port="${hostport##*:}"
+    [[ "$port" == "$host" ]] && port=443
+
+    # Certificate info
+    local cert
+    cert=$(echo | timeout 8 openssl s_client \
+      -connect "${host}:${port}" -servername "$host" \
+      2>/dev/null | openssl x509 -noout -text 2>/dev/null || true)
+
+    if [ -n "$cert" ]; then
+      {
+        echo "=== ${host}:${port} ==="
+        echo "$cert" | grep -E 'Subject:|Issuer:|Not Before|Not After|DNS:|Subject Alternative Name' || true
+        echo ""
+      } >> "$certs"
+
+      # Days until expiry
+      local not_after days_left
+      not_after=$(echo | timeout 8 openssl s_client \
+        -connect "${host}:${port}" -servername "$host" \
+        2>/dev/null | openssl x509 -noout -enddate 2>/dev/null \
+        | cut -d= -f2 || true)
+      if [ -n "$not_after" ]; then
+        days_left=$(( ( $(date -d "$not_after" +%s 2>/dev/null \
+                           || date -j -f "%b %d %T %Y %Z" "$not_after" +%s 2>/dev/null \
+                           || echo 0) - $(date +%s) ) / 86400 )) 2>/dev/null || true
+        if [ "${days_left:-9999}" -lt 30 ] 2>/dev/null; then
+          echo "${host}:${port}  |  CERT_EXPIRING_IN_${days_left}d  |  $not_after" >> "$issues"
+        fi
+      fi
+    fi
+
+    # Deprecated protocol detection
+    for proto in tls1 tls1_1; do
+      if echo | timeout 5 openssl s_client \
+           -connect "${host}:${port}" -servername "$host" \
+           -"$proto" 2>/dev/null | grep -q "CONNECTED" 2>/dev/null; then
+        echo "${host}:${port}  |  DEPRECATED: ${proto/tls1/TLS1.0}" \
+          | sed 's/tls1_1/TLS1.1/' >> "$issues"
+      fi
+    done
+
+  done < "$dir/https_hosts.txt"
+
+  ok "TLS issues: $(count "$issues")"
+
+  # Nuclei SSL templates
+  if has nuclei && nonempty "$dir/https_hosts.txt"; then
+    # Convert host:port → https://host:port for nuclei
+    sed 's|^|https://|' "$dir/https_hosts.txt" > "$dir/https_urls.txt"
+    spin_start "nuclei: SSL/TLS templates…"
+    nuclei -l "$dir/https_urls.txt" \
+      -tags ssl,tls \
+      -silent -o "$dir/nuclei_ssl.txt" \
+      -rate-limit "$NUCLEI_RATE" -concurrency "$NUCLEI_CONC" \
+      2>>"$LOG_FILE" || true
+    spin_stop
+    ok "nuclei SSL: $(count "$dir/nuclei_ssl.txt") finding(s)"
+  fi
+
+  state_mark_done "ssl"
+  prune_empty "$dir"
+}
+
 # ── Report ───────────────────────────────────────────────────
 run_report() {
   prune_empty "$OUT_DIR"            # clean 0-byte files before we list anything
@@ -1340,7 +1592,7 @@ run_report() {
 # ── Full pipeline ────────────────────────────────────────────
 run_full() {
   local start=$SECONDS
-  STEP_TOTAL=12; STEP_N=0           # enables [n/12] progress in section()
+  STEP_TOTAL=19; STEP_N=0
   run_subdomains
   run_http_probe
   run_origin
@@ -1352,23 +1604,30 @@ run_full() {
   run_nuclei
   run_dorks
   run_cloud
+  run_headers
+  run_graphql
+  run_ssl
   run_report
-  run_html_report  
+  run_html_report
   STEP_TOTAL=0
   prune_empty "$OUT_DIR"            # final sweep of any 0-byte files
   local elapsed=$(( SECONDS - start ))
   local mm=$(( elapsed / 60 )) ss=$(( elapsed % 60 ))
 
   # Completion box with headline numbers
-  local subs live nucl orig chlng
+  local subs live nucl orig chlng hdrs_n gql_n ssl_n
   subs=$(count "$OUT_DIR/subdomains/subs.txt")
   live=$(count "$OUT_DIR/http/live_urls.txt")
   orig=$(count "$OUT_DIR/origin/origins.txt")
   nucl=$(count "$OUT_DIR/nuclei/findings.txt")
   chlng=$(count "$OUT_DIR/http/challenged.txt")
+  hdrs_n=$(count "$OUT_DIR/headers/host_injection.txt")
+  gql_n=$(count "$OUT_DIR/graphql/introspection_enabled.txt")
+  ssl_n=$(count "$OUT_DIR/ssl/issues.txt")
   echo ""
   local -a boxlines=(
     "hosts ${BOLD}$subs${RESET}   live ${BOLD}$live${RESET}   challenged ${BOLD}$chlng${RESET}   origins ${BOLD}$orig${RESET}   nuclei ${BOLD}$nucl${RESET}"
+    "host-inj ${BOLD}$hdrs_n${RESET}   graphql ${BOLD}$gql_n${RESET}   ssl issues ${BOLD}$ssl_n${RESET}"
     "elapsed ${BOLD}${mm}m ${ss}s${RESET}"
     "report  ${CYAN}$OUT_DIR/report/report.txt${RESET}"
   )
@@ -1386,28 +1645,35 @@ interactive_menu() {
     echo ""
     box "$DIM" "${BOLD}target${RESET} ${GREEN}$TARGET_HOST${RESET}   ${BOLD}mode${RESET} ${MAGENTA}${pmode}${RESET}"
     echo ""
-    echo -e "   ${CYAN}RECON${RESET}                              ${CYAN}CONTENT${RESET}"
-    echo -e "   $(_mk subdomains) ${BOLD}1${RESET}  Subdomain Enumeration    $(_mk urls)   ${BOLD}5${RESET}  URL Collection"
-    echo -e "   $(_mk http) ${BOLD}2${RESET}  HTTP Probe + WAF         $(_mk js)   ${BOLD}6${RESET}  JavaScript Recon"
-    echo -e "   $(_mk origin) ${BOLD}3${RESET}  Origin Discovery         $(_mk fuzz)   ${BOLD}7${RESET}  Directory Bruteforce"
-    echo -e "   $(_mk ports) ${BOLD}4${RESET}  Port Scanning            $(_mk params)   ${BOLD}8${RESET}  Parameter Discovery"
+    echo -e "   ${CYAN}RECON                               CONTENT${RESET}"
+    echo -e "   $(_mk subdomains) ${BOLD}[1]${RESET}  Subdomain Enumeration    $(_mk urls)    ${BOLD}[5]${RESET}  URL Collection"
+    echo -e "   $(_mk http)       ${BOLD}[2]${RESET}  HTTP Probe + WAF         $(_mk js)     ${BOLD}[6]${RESET}  JavaScript Recon"
+    echo -e "   $(_mk origin)     ${BOLD}[3]${RESET}  Origin Discovery (CDN)   $(_mk fuzz)   ${BOLD}[7]${RESET}  Directory Bruteforce"
+    echo -e "   $(_mk ports)      ${BOLD}[4]${RESET}  Port Scanning            $(_mk params) ${BOLD}[8]${RESET}  Parameter + CORS"
     echo ""
-    echo -e "   ${CYAN}VULN / OSINT${RESET}                       ${CYAN}ACTIONS${RESET}"
-    echo -e "   $(_mk nuclei) ${BOLD}9${RESET}  Vulnerability Scan       ${BOLD}F${RESET}  ${GREEN}Run Full Pipeline${RESET}"
-    echo -e "   $(_mk dorks) ${BOLD}10${RESET} Google / GitHub Dorks    ${BOLD}R${RESET}  Generate Report"
-    echo -e "   $(_mk cloud) ${BOLD}11${RESET} Cloud Bucket Recon       ${BOLD}Q${RESET}  Quit"
+    echo -e "   ${CYAN}VULN / OSINT                        ACTIONS${RESET}"
+    echo -e "   $(_mk nuclei)    ${BOLD}[9]${RESET}   Vulnerability Scan       ${BOLD}[F]${RESET}  ${GREEN}Run Full Pipeline${RESET}"
+    echo -e "   $(_mk dorks)     ${BOLD}[10]${RESET}  Google / GitHub Dorks    ${BOLD}[R]${RESET}  Generate Reports"
+    echo -e "   $(_mk cloud)     ${BOLD}[11]${RESET}  Cloud Bucket Recon       ${BOLD}[Q]${RESET}  Quit"
     echo ""
-    echo -e "   ${DIM}✓ = already run this session${RESET}"
+    echo -e "   ${DIM}NEW MODULES${RESET}"
+    echo -e "   $(_mk headers)   ${BOLD}[15]${RESET}  Security Headers + CORS  ${DIM}(host injection · CRLF)${RESET}"
+    echo -e "   $(_mk graphql)   ${BOLD}[16]${RESET}  GraphQL Recon            ${DIM}(endpoints · introspection · batch)${RESET}"
+    echo -e "   $(_mk ssl)       ${BOLD}[17]${RESET}  TLS / SSL Analysis       ${DIM}(certs · deprecated protocols)${RESET}"
+    echo ""
+    echo -e "   ${DIM}✓ = done   ·  = pending${RESET}"
     echo ""
     read -rp "$(echo -e "  ${BOLD}tanya${RESET} ${GREEN}>${RESET} ")" choice
     echo ""
     case "${choice^^}" in
-      1) run_subdomains ;; 2) run_http_probe ;; 3) run_origin ;; 4) run_ports ;;
-      5) run_urls ;; 6) run_js ;; 7) run_fuzz ;; 8) run_params ;;
-      9) run_nuclei ;; 10) run_dorks ;; 11) run_cloud ;;
-      R) run_report ;; H) run_html_report ;;
+      1) run_subdomains ;;  2) run_http_probe ;;  3) run_origin ;;  4) run_ports ;;
+      5) run_urls ;;        6) run_js ;;           7) run_fuzz ;;    8) run_params ;;
+      9) run_nuclei ;;     10) run_dorks ;;       11) run_cloud ;;
+      15) run_headers ;;   16) run_graphql ;;     17) run_ssl ;;
+      R) run_report; run_html_report ;;
+      H) run_html_report ;;
       F) run_full ;; Q) prune_empty "$OUT_DIR"; ok "Results in $OUT_DIR"; exit 0 ;;
-      *) warn "Invalid choice"; continue ;;
+      *) warn "Invalid choice (1-11, 15-17, F/R/Q)"; continue ;;
     esac
     prune_empty "$OUT_DIR"          # tidy 0-byte files after every action
   done
@@ -1436,7 +1702,9 @@ $(echo -e "${BOLD}Options:${RESET}")
   --help              This help
 
 $(echo -e "${BOLD}Modules:${RESET}")
-  subdomains http origin ports urls js fuzz params nuclei dorks cloud report
+  subdomains  http  origin  ports  urls  js  fuzz  params
+  nuclei  dorks  cloud
+  headers  graphql  ssl  report  html
 
 EOF
   exit 0
@@ -1499,12 +1767,13 @@ main() {
     --module)
       [ -z "${2:-}" ] && die "Specify a module name"
       case "$2" in
-        subdomains) run_subdomains ;; http) run_http_probe ;; origin) run_origin ;; ports) run_ports ;;
-        urls) run_urls ;; js) run_js ;;
-        fuzz) run_fuzz ;; params) run_params ;; nuclei) run_nuclei ;;
-        dorks) run_dorks ;; cloud) run_cloud ;; report) run_report ;;
-        html) run_html_report ;;     
-        *) die "Unknown module: $2" ;;
+        subdomains) run_subdomains ;; http) run_http_probe ;; origin) run_origin ;;
+        ports) run_ports ;; urls) run_urls ;; js) run_js ;; fuzz) run_fuzz ;;
+        params) run_params ;; nuclei) run_nuclei ;;
+        dorks) run_dorks ;; cloud) run_cloud ;; headers) run_headers ;;
+        graphql) run_graphql ;; ssl) run_ssl ;; report) run_report ;;
+        html) run_html_report ;;
+        *) die "Unknown module: $2 — run --help for the module list" ;;
       esac
       prune_empty "$OUT_DIR" ;;
     "") interactive_menu ;;

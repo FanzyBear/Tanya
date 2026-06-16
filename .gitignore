@@ -1,3 +1,11 @@
 CLAUDE.md
 .claude/
-graphify-out
+graphify-out/
+
+# Go build output
+tanya
+*.exe
+*.test
+
+# Scan results (may contain sensitive target data)
+output/

@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 # ================================================================
-#  install.sh  —  dependency installer for tanya.sh  v6.1
+#  install.sh  —  installer for tanya v6.2  (Go binary + recon tools)
 #
 #  Tiers:
-#    core         curl  jq  python3  pip(rich)          (always)
-#    recommended  subfinder httpx naabu nuclei katana ffuf cdncheck
-#    optional     assetfinder amass waybackurls gau hakrawler arjun
-#                 dnsx subzy dalfox gf chaos puredns
+#    core         Go toolchain  curl  jq  python3       (always)
+#                 → also builds the tanya binary
+#    recommended  subfinder httpx naabu nuclei katana ffuf cdncheck subzy
+#                 jsluice subjs
+#    optional     assetfinder amass waybackurls gau arjun hakrawler gospider
+#                 dnsx dalfox gf chaos puredns
 #                 trufflehog gitleaks s3scanner
-#                 + system: host / nslookup (dnsutils)  nc (netcat)
-#                 + openssl (headers/graphql/ssl modules)
+#                 + system: nc (netcat)  openssl  host / nslookup (dnsutils)
 #
 #  Usage:
-#    ./install.sh                core + recommended
+#    ./install.sh                core + recommended  (builds tanya binary)
 #    ./install.sh --optional     + optional tools
 #    ./install.sh --seclists     + clone SecLists → ~/SecLists
 #    ./install.sh --all          recommended + optional + seclists
-#    ./install.sh --minimal      core only
+#    ./install.sh --minimal      core only  (Go + build, no recon tools)
 #    ./install.sh --help
 #
 #  Package managers: apt / dnf / pacman / brew
@@ -55,21 +56,21 @@ for _a in "$@"; do
     --help|-h)
       cat <<'HELP'
 
-install.sh  —  tanya.sh dependency installer  v6.1
+install.sh  —  tanya v6.2 installer
 
 Tiers:
-  core         curl  jq  python3  rich(pip)              (always)
-  recommended  subfinder httpx naabu nuclei katana ffuf cdncheck
-  optional     assetfinder amass waybackurls gau hakrawler arjun
-               dnsx subzy dalfox gf chaos puredns
-               trufflehog gitleaks s3scanner  +  host / nc
+  core         Go 1.22+  curl  jq  python3  → builds tanya binary
+  recommended  subfinder httpx naabu nuclei katana ffuf cdncheck subzy jsluice subjs
+  optional     assetfinder amass waybackurls gau arjun hakrawler gospider
+               dnsx dalfox gf chaos puredns
+               trufflehog gitleaks s3scanner  +  nc / openssl
 
 Usage:
   ./install.sh                 core + recommended
   ./install.sh --optional      also install optional tools
   ./install.sh --seclists      also clone SecLists into ~/SecLists
   ./install.sh --all           recommended + optional + seclists
-  ./install.sh --minimal       core only
+  ./install.sh --minimal       core only (Go build, no recon tools)
   ./install.sh --help
 
 Uses apt / dnf / pacman / brew for system packages.
@@ -123,7 +124,11 @@ goget() {
 
 # ── Go toolchain ─────────────────────────────────────────────────
 ensure_go() {
-  if has go; then _ok "go  ${D}($(go version | awk '{print $3}'))${Z}"; return 0; fi
+  if has go; then
+    local ver; ver=$(go version | awk '{print $3}')
+    _ok "go  ${D}($ver)${Z}"
+    return 0
+  fi
   _info "Go toolchain not found — installing"
   case "$PM" in
     apt)    pkg go golang-go golang go go ;;
@@ -135,6 +140,32 @@ ensure_go() {
   has go || { _err "Go still not on PATH — open a new shell and re-run"; return 1; }
 }
 
+# ── Build the tanya binary ────────────────────────────────────────
+build_tanya() {
+  _hdr "tanya binary  ${D}(go build)${Z}"
+  _hr
+
+  ensure_go || { _err "Cannot build tanya — Go toolchain missing"; return 1; }
+
+  if [ ! -f "$SCRIPT_DIR/go.mod" ]; then
+    _err "go.mod not found in $SCRIPT_DIR — is this the project root?"
+    return 1
+  fi
+
+  _info "go mod tidy…"
+  (cd "$SCRIPT_DIR" && go mod tidy 2>&1) \
+    || _warn "go mod tidy had issues (network?)"
+
+  _info "go build -ldflags=-s -w …"
+  if (cd "$SCRIPT_DIR" && go build -ldflags="-s -w" -o tanya . 2>&1); then
+    chmod +x "$SCRIPT_DIR/tanya"
+    _ok "tanya  ${D}→ $SCRIPT_DIR/tanya${Z}"
+  else
+    _err "go build failed — fix errors above then re-run"
+    return 1
+  fi
+}
+
 # ── Tier: core ───────────────────────────────────────────────────
 install_core() {
   _hdr "Core  ${D}(required)${Z}"
@@ -144,19 +175,7 @@ install_core() {
   has jq      && _ok "jq"      || pkg jq
   has python3 && _ok "python3" || pkg python3 python3 python3 python python
 
-  # Python TUI dependency
-  if has pip3 || has pip; then
-    local _pip; has pip3 && _pip=pip3 || _pip=pip
-    if python3 -c "import rich" 2>/dev/null; then
-      _ok "rich  ${D}(already installed)${Z}"
-    else
-      _info "pip install rich"
-      "$_pip" install --quiet rich >/dev/null 2>&1 \
-        && _ok "rich" || _warn "pip install rich failed — run manually"
-    fi
-  else
-    _warn "pip not found — install rich manually:  pip install rich"
-  fi
+  build_tanya
 }
 
 # ── Tier: recommended ────────────────────────────────────────────
@@ -164,7 +183,7 @@ install_recommended() {
   _hdr "Recommended  ${D}(ProjectDiscovery suite + ffuf)${Z}"
   _hr
 
-  ensure_go || { _warn "skipping Go tools (no toolchain)"; return 0; }
+  ensure_go || { _warn "skipping Go recon tools (no toolchain)"; return 0; }
 
   goget subfinder "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
   goget httpx     "github.com/projectdiscovery/httpx/cmd/httpx@latest"
@@ -173,6 +192,9 @@ install_recommended() {
   goget katana    "github.com/projectdiscovery/katana/cmd/katana@latest"
   goget cdncheck  "github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest"
   goget ffuf      "github.com/ffuf/ffuf/v2@latest"
+  goget subzy     "github.com/PentestPad/subzy@latest"
+  goget jsluice   "github.com/BishopFox/jsluice/cmd/jsluice@latest"
+  goget subjs     "github.com/lc/subjs@latest"
 
   if has nuclei; then
     _info "updating nuclei templates"
@@ -204,10 +226,10 @@ install_optional() {
 
   # Crawling
   goget hakrawler   "github.com/hakluke/hakrawler@latest"
+  goget gospider    "github.com/jaeles-project/gospider@latest"
 
   # Bug bounty
   goget dalfox      "github.com/hahwul/dalfox/v2@latest"
-  goget subzy       "github.com/PentestPad/subzy@latest"
   goget gf          "github.com/tomnomnom/gf@latest"
 
   # Secrets / cloud
@@ -258,7 +280,7 @@ install_optional() {
   fi
 
   # System utilities
-  _hdr "System utilities  ${D}(DNS + netcat)${Z}"
+  _hdr "System utilities  ${D}(DNS + network)${Z}"
   _hr
   has nc       && _ok "nc"       || pkg netcat   netcat-openbsd nmap-ncat openbsd-netcat netcat
   has host     && _ok "host"     || pkg host     dnsutils bind-utils bind-tools bind
@@ -281,7 +303,7 @@ install_seclists() {
   fi
 }
 
-# ── Finalize: config.env + executable bits ───────────────────────
+# ── Finalize: config.env + PATH ──────────────────────────────────
 finalize() {
   _hdr "Finishing up"
   _hr
@@ -291,8 +313,8 @@ finalize() {
     _ok "config.env  ${D}(left untouched)${Z}"
   else
     cat > "$cfg" <<'CFG'
-# tanya.sh configuration  v6.1
-# All keys are optional.  Source order: script defaults → this file.
+# tanya configuration  v6.2
+# All keys are optional — binary defaults are used if unset.
 
 # ── Threading & rate limits ──────────────────────────────────────
 HTTPX_THREADS=100
@@ -308,18 +330,20 @@ KATANA_DEPTH=5
 
 # ── Wordlists ────────────────────────────────────────────────────
 FFUF_WORDLIST="$HOME/SecLists/Discovery/Web-Content/common.txt"
-# DNS_WORDLIST="$HOME/SecLists/Discovery/DNS/subdomains-top1million-5000.txt"
 
 # ── API keys  (blank = feature silently skipped) ─────────────────
 SECURITYTRAILS_API_KEY=""
 SHODAN_API_KEY=""
-# CHAOS_KEY=""
 CFG
     _ok "wrote starter config.env"
   fi
 
-  [ -f "$SCRIPT_DIR/tanya.sh"    ] && chmod +x "$SCRIPT_DIR/tanya.sh"    && _ok "tanya.sh    is executable"
-  [ -f "$SCRIPT_DIR/tanya_ui.py" ] && chmod +x "$SCRIPT_DIR/tanya_ui.py" && _ok "tanya_ui.py is executable"
+  # Verify the binary was built
+  if [ -f "$SCRIPT_DIR/tanya" ]; then
+    _ok "tanya binary present  ${D}→ $SCRIPT_DIR/tanya${Z}"
+  else
+    _warn "tanya binary not found — run:  cd $SCRIPT_DIR && go build -o tanya ."
+  fi
 
   case ":$PATH:" in
     *":$GOBIN:"*) : ;;
@@ -331,7 +355,7 @@ CFG
 }
 
 # ── Run ──────────────────────────────────────────────────────────
-printf '\n%s◆  tanya.sh installer  v6.1%s\n' "$C$B" "$Z"
+printf '\n%s◆  tanya v6.2 installer%s\n' "$C$B" "$Z"
 [ -n "$PM" ] \
   && _info "package manager: $PM" \
   || _warn "no apt/dnf/pacman/brew detected — system packages must be installed manually"
@@ -343,9 +367,10 @@ $DO_SECLISTS    && install_seclists
 finalize
 
 _hr
-printf '\n%s◆  Done.%s  tanya.sh v6.1 ready.\n' "$C" "$Z"
-_info "dep check:  ${C}./tanya.sh example.com --module subdomains${Z}"
-_info "bash TUI:   ${C}./tanya.sh example.com${Z}"
-_info "python TUI: ${C}python3 tanya_ui.py example.com${Z}"
-_info "full scan:  ${C}./tanya.sh example.com --full${Z}  ${D}(authorized targets only)${Z}"
+printf '\n%s◆  Done.%s  tanya v6.2 ready.\n' "$C" "$Z"
+_info "TUI:       ${C}./tanya example.com${Z}                    ${D}(interactive full-screen menu)${Z}"
+_info "full scan: ${C}./tanya example.com --full${Z}             ${D}(authorized targets only)${Z}"
+_info "strict:    ${C}./tanya www.example.com --strict${Z}       ${D}(lock crawler to exact FQDN)${Z}"
+_info "resume:    ${C}./tanya example.com --resume${Z}           ${D}(continue last run, log preserved)${Z}"
+_info "dep check: ${C}./tanya example.com${Z}  then press ${C}D${Z}"
 printf '\n'

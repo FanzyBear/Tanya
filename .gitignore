@@ -1,6 +1,9 @@
 CLAUDE.md
 .claude/
 graphify-out/
+config.env
+blog.md
+.gitignore
 
 # Go build output
 tanya

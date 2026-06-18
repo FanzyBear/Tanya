@@ -1,101 +1,94 @@
-# Tanya — Bug Bounty Web Recon Pipeline
-
-```
+<p align="center">
+  <pre>
   ████████╗ █████╗ ███╗   ██╗██╗   ██╗  █████╗        _._     _,-'""`-._
      ██╔══╝██╔══██╗████╗  ██║╚██╗ ██╔╝ ██╔══██╗    (,-.`._,'(       |\`-/|
      ██║   ███████║██╔██╗ ██║ ╚████╔╝  ███████║         `-.-' \ )-`( , o o)
      ██║   ██╔══██║██║╚██╗██║  ╚██╔╝   ██╔══██║              `-    \`_`"'-
      ██║   ██║  ██║██║ ╚████║   ██║    ██║  ██║
      ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═╝  ╚═╝
+  </pre>
+</p>
 
-  Bug Bounty Web Recon Pipeline  v6.2  ·  Go + Bubbletea TUI  ·  authorized targets only
-```
+<p align="center">
+  <b>Bug Bounty Web Recon Pipeline</b><br>
+  v6.2 &nbsp;·&nbsp; Go + Bubbletea TUI &nbsp;·&nbsp; 17 modules &nbsp;·&nbsp; Authorized targets only
+</p>
 
-A single compiled Go binary that orchestrates a 17-module web recon pipeline. Launch it, get a full-screen Bubbletea TUI with live stats — or pass `--full` for a headless end-to-end run.
-
-> **Authorization.** Only scan assets you own or are explicitly in-scope for. You are responsible for how you use this tool.
+<p align="center">
+  <img src="https://img.shields.io/badge/language-Go-00ADD8?style=flat-square&logo=go" />
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL2-lightgrey?style=flat-square" />
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
+  <img src="https://img.shields.io/badge/status-active-brightgreen?style=flat-square" />
+</p>
 
 ---
 
-## Quick start
+## Overview
+
+Tanya is a single compiled Go binary that orchestrates a 17-module web recon pipeline. Point it at a domain and it runs subdomain enumeration, HTTP probing, JS analysis, vulnerability scanning, and more — all chained automatically with a full-screen TUI showing live progress.
+
+No Docker. No config files required. No Python dependency hell. Build once, run anywhere.
+
+> **Authorization required.** Only scan systems you own or are explicitly permitted to test — a bug bounty program you're enrolled in, a signed pentest engagement, or your own infrastructure.
+
+---
+
+## Features
+
+- **17 chained recon modules** covering the full bug bounty workflow
+- **Full-screen TUI** built with Bubbletea — live stats, module navigation, per-category runs
+- **Automatic scope detection** — apex, strict, single-host, and PaaS modes auto-selected from the target you provide
+- **CDN/WAF-aware** — detects Cloudflare, Akamai, Imperva, DataDome, PerimeterX, AWS WAF; separates challenged hosts from clean targets so your tools run against the right surface
+- **Origin IP discovery** — finds real backend IPs behind CDNs for direct-connect scanning
+- **Comprehensive JS recon** — endpoints, DOM XSS sinks, secrets, source maps, admin routes, cloud assets, tech fingerprinting, page→JS mapping
+- **Concurrent 403 bypass** — 15 goroutines testing header tricks and path variants in parallel
+- **Resume support** — restart a scan exactly where it left off
+- **Interactive HTML report** — attack surface graph, triage section, search, WSL-aware paths
+- **Graceful degradation** — missing tools skip with a warning, nothing crashes
+
+---
+
+## Quick Start
 
 ```bash
 git clone https://github.com/FanzyBear/Tanya.git && cd Tanya
-./install.sh --all          # install Go + recon tools + SecLists, build binary
 
-./tanya example.com         # full-screen TUI
-./tanya example.com --full  # headless, run all 17 modules
+# Install Go, all recon tools, and SecLists (takes a few minutes)
+./install.sh --all
+
+# Interactive TUI
+./tanya example.com
+
+# Headless — run all 17 modules and exit
+./tanya example.com --full
 ```
 
 ---
 
-## Interface
+## Screenshots
 
-Launch without flags to get the full-screen TUI:
+> TUI — live module progress and stats bar
 
 ```
   ──────────────────────────────────────────────────────────────────────────────
-   ◆ TANYA  v6.2  ›  example.com  [apex]                      7/17  ████░░░░  41%
+   ◆ TANYA  v6.2  ›  example.com  [apex]                      9/17  ██████░░  52%
      output/example.com_20260615_142301
   ──────────────────────────────────────────────────────────────────────────────
 
   ◆ RECON ──────────────────────────────────────────────────────────────────────
 
-  ✓  1  Subdomain Enum    ✓  2  HTTP Probe + WAF    ▶  3  Origin Discovery
-  ✓  4  Port Scanning     ✓  5  URL Collection         6  JS Recon
+  ✓  1  Subdomain Enum    ✓  2  HTTP Probe + WAF    ✓  3  Origin Discovery
+  ✓  4  Port Scanning     ✓  5  URL Collection      ✓  6  JS Recon
 
   ◆ ATTACK ─────────────────────────────────────────────────────────────────────
 
-     7  Dir Bruteforce       8  Params + CORS           9  Vuln Scan
+  ✓  7  Dir Bruteforce    ✓  8  Params + CORS       ▶  9  Vuln Scan
     10  Sub Takeover        11  403 Bypass             12  XSS Scan
-
-  ◆ INTEL ──────────────────────────────────────────────────────────────────────
-
-    13  Dorks              14  Cloud Buckets           15  Header Audit
-    16  GraphQL Recon      17  TLS / SSL
 
   ──────────────────────────────────────────────────────────────────────────────
   subs:247  live:89  nuclei:12  secrets:3  xss:0  bypass:2  graphql:0  ssl:1
   ──────────────────────────────────────────────────────────────────────────────
   ↑↓/jk nav  ↵ run  tab cat  g/G first/last  F full  R report  D deps  Q quit
-  E RECON  A ATTACK  I INTEL  C clear done  1-9 jump
-  ──────────────────────────────────────────────────────────────────────────────
-  ✓  nuclei  ·  14 findings  ·  2m12s
-  ▶  Vuln Scan  ·  Severity scan + exposures + misconfig across all live targets
-```
-
-### TUI keys
-
-| Key | Action |
-|-----|--------|
-| `↑↓` / `j k` | navigate modules |
-| `Enter` / `Space` | run selected module |
-| `tab` / `shift+tab` | jump to next / previous category |
-| `g` / `G` | jump to first / last module |
-| `1`–`9` | jump to module by number |
-| `E` | run full **RECON** category (modules 1–6) |
-| `A` | run full **ATTACK** category (modules 7–12) |
-| `I` | run full **INTEL** category (modules 13–17) |
-| `F` | run all 17 modules end-to-end |
-| `R` | generate text + HTML report |
-| `D` | dependency check |
-| `C` | clear done state for selected module (re-run it) |
-| `Q` / `ctrl+c` | quit |
-
-After each module finishes, the TUI shows a result line: `✓ nuclei · 14 findings · 2m12s`.
-
-### CLI flags
-
-```bash
-./tanya example.com                   # interactive TUI
-./tanya example.com --full            # all 17 modules end-to-end
-./tanya example.com --resume          # continue last run (log + state preserved)
-./tanya example.com --module nuclei   # run a single module
-./tanya example.com --passive         # skip noisy active scans
-./tanya example.com --single          # force single-host (no subdomain enum)
-./tanya example.com --strict          # lock crawler + URLs to exact FQDN only
-./tanya example.com --apex            # force apex mode (enum from registrable root)
-./tanya --help
 ```
 
 ---
@@ -104,250 +97,268 @@ After each module finishes, the TUI shows a result line: `✓ nuclei · 14 findi
 
 | # | Module | What it does | Key tools |
 |---|--------|--------------|-----------|
-| 1 | **Subdomain Enum** | Active + passive discovery, cert transparency, DNS bruteforce | subfinder · assetfinder · amass · chaos · crt.sh · dnsx |
-| 2 | **HTTP Probe + WAF** | Live service detection, tech stack, WAF fingerprint, edge challenge classification (Cloudflare / Akamai / Imperva / DataDome / PerimeterX / AWS WAF) | httpx · nuclei |
-| 3 | **Origin Discovery** | CDN vs origin IP classification, direct-connect verification | cdncheck · dnsx |
-| 4 | **Port Scanning** | Top-1000 ports + high-risk port flagging (Docker / Redis / Elastic / etcd …) | naabu · nc fallback |
-| 5 | **URL Collection** | Crawl + archive (wayback/gau/gospider), interesting file detection | katana · waybackurls · gau · gospider |
-| 6 | **JS Recon** | JS download + comprehensive extraction: endpoints, DOM sinks, secrets, tech fingerprinting, admin routes, cloud assets, source maps, subdomains, GraphQL patterns | jsluice · subjs · trufflehog · gitleaks · regexp fallback |
-| 7 | **Dir Bruteforce** | Content discovery against live URLs; results aggregated into `fuzz/findings.txt` | ffuf |
-| 8 | **Params + CORS** | Param classification (SSRF/IDOR/LFI/redirect), nuclei SSRF probe on candidates | arjun · nuclei |
-| 9 | **Vuln Scan** | Severity low→critical + exposures + misconfig; gentle pass on WAF-challenged hosts; CDN-aware (origin IPs included) | nuclei |
-| 10 | **Sub Takeover** | CNAME-based detection + nuclei takeover templates | subzy · nuclei |
-| 11 | **403 Bypass** | Header tricks + path variants on blocked endpoints — **parallel** (15 goroutines) | stdlib net/http |
-| 12 | **XSS Scan** | gf pre-filter → dalfox reflected/DOM XSS | dalfox · gf |
-| 13 | **Dorks** | Ready-to-paste Google + GitHub dork queries scoped to the exact target host | — |
-| 14 | **Cloud Buckets** | Bucket name permutation (from registrable apex) + public access check; raw output preserved, noise-filtered results separate | s3scanner |
-| 15 | **Header Audit** | Security headers, host-header injection, CORS deep-check (null origin + reflected origin) | nuclei · stdlib |
-| 16 | **GraphQL Recon** | Endpoint discovery, introspection test, batch query check, nuclei GraphQL templates | stdlib · nuclei |
-| 17 | **TLS / SSL** | Certificate expiry, nuclei SSL/TLS templates | openssl · nuclei |
+| 1 | **Subdomain Enum** | Active + passive discovery, cert transparency, DNS bruteforce | subfinder, assetfinder, amass, chaos, crt.sh, dnsx |
+| 2 | **HTTP Probe + WAF** | Live detection, tech stack, WAF fingerprint, edge challenge classification | httpx, nuclei |
+| 3 | **Origin Discovery** | CDN vs origin classification, direct-connect verification | cdncheck, dnsx |
+| 4 | **Port Scanning** | Top-1000 ports + high-risk flagging (Docker, Redis, Elastic, etcd…) | naabu |
+| 5 | **URL Collection** | Crawl + archive; interesting file detection; URL path tree | katana, waybackurls, gau, gospider |
+| 6 | **JS Recon** | Endpoints, DOM sinks, secrets, source maps, admin routes, cloud assets, tech, page→JS map | jsluice, subjs, trufflehog, gitleaks |
+| 7 | **Dir Bruteforce** | Content discovery against live URLs | ffuf |
+| 8 | **Params + CORS** | Parameter classification (SSRF/IDOR/LFI/redirect), CORS deep-check, SSRF probe | arjun, nuclei |
+| 9 | **Vuln Scan** | CVEs, exposures, misconfigs; CDN-aware; challenged host slow-pass | nuclei |
+| 10 | **Sub Takeover** | CNAME dangling detection + takeover templates | subzy, nuclei |
+| 11 | **403 Bypass** | Header tricks + path variants, 15 goroutines in parallel | stdlib |
+| 12 | **XSS Scan** | Reflected + DOM XSS via gf pre-filter | dalfox, gf |
+| 13 | **Dorks** | Scoped Google + GitHub dork queries ready to paste | — |
+| 14 | **Cloud Buckets** | Bucket permutation + public access check | s3scanner |
+| 15 | **Header Audit** | Security headers, host-header injection, CORS | nuclei, stdlib |
+| 16 | **GraphQL Recon** | Endpoint discovery, introspection test, batch query check | nuclei, stdlib |
+| 17 | **TLS / SSL** | Cert expiry, deprecated protocols, nuclei SSL templates | openssl, nuclei |
 
-### Category runs
+### Category shortcuts
 
-The three categories can be run with a single key in the TUI or via `--_run-category`:
-
-| Category | Modules | TUI key |
-|----------|---------|---------|
-| **RECON** | Subdomains, HTTP, Origin, Ports, URLs, JS | `E` |
-| **ATTACK** | Fuzz, Params, Nuclei, Takeover, 403bypass, XSS | `A` |
-| **INTEL** | Dorks, Cloud, Headers, GraphQL, SSL | `I` |
+| Category | Modules | TUI key | CLI |
+|----------|---------|---------|-----|
+| RECON | 1–6 | `E` | `--_run-category recon` |
+| ATTACK | 7–12 | `A` | `--_run-category attack` |
+| INTEL | 13–17 | `I` | `--_run-category intel` |
 
 ---
 
-## Target formats & scope modes
+## TUI Keys
 
-Scope is **auto-detected** from the target you provide — no flags needed for the common cases:
+| Key | Action |
+|-----|--------|
+| `↑↓` / `j k` | Navigate modules |
+| `Enter` / `Space` | Run selected module |
+| `Tab` / `Shift+Tab` | Jump between categories |
+| `g` / `G` | First / last module |
+| `1`–`9` | Jump to module by number |
+| `E` / `A` / `I` | Run full RECON / ATTACK / INTEL category |
+| `F` | Run all 17 modules end-to-end |
+| `R` | Generate text + HTML report |
+| `D` | Check installed tools |
+| `C` | Clear done state (re-run selected module) |
+| `Q` / `ctrl+c` | Quit |
 
-| Target | Auto scope | Behaviour |
+---
+
+## CLI Flags
+
+```bash
+./tanya example.com                   # interactive TUI
+./tanya example.com --full            # all 17 modules, headless
+./tanya example.com --resume          # continue from last run
+./tanya example.com --module nuclei   # run one module
+./tanya example.com --passive         # skip active scans
+./tanya example.com --single          # no subdomain enumeration
+./tanya example.com --strict          # lock to exact FQDN
+./tanya example.com --apex            # force full subdomain enum
+./tanya --help
+```
+
+---
+
+## Scope Modes
+
+Scope is auto-detected from the target you provide.
+
+| Target | Auto mode | Behaviour |
 |--------|-----------|-----------|
-| `example.com` | `apex` | full subdomain enumeration from `example.com` |
-| `www.example.com` | `strict` | **locked to `www.example.com` only** — crawler + URLs filtered to exact FQDN |
-| `app.example.com/path` | `strict` | scheme + path stripped; locked to `app.example.com` |
-| `app.herokuapp.com` | `single` | PaaS host — no subdomain enum, exact host only |
-| `203.0.113.10` | `single` | IP — single-host mode |
+| `example.com` | `apex` | full subdomain enumeration |
+| `www.example.com` | `strict` | locked to exact FQDN, no sub-enum |
+| `app.example.com/path` | `strict` | path stripped, locked to subdomain |
+| `app.heroku.com` | `single` | PaaS — no sub-enum |
+| `203.0.113.10` | `single` | IP — single host only |
 
-PaaS platforms (Heroku, Vercel, Netlify, GitHub Pages, Cloudflare Workers, Fly.io, Render, …) are auto-detected and forced to single-host mode.
+PaaS platforms (Heroku, Vercel, Netlify, GitHub Pages, Cloudflare Workers, Fly.io, Render, ~25 others) are auto-detected and forced to single-host mode.
 
-The rule: if the host you supply **is** the registrable apex (e.g. `example.com`, `example.co.uk`) → `apex` mode. If it's a subdomain (e.g. `www.example.com`, `api.staging.example.com`) → `strict` mode automatically.
-
-### Override flags
-
-| Flag | Mode | Use when |
-|------|------|----------|
-| `--strict` | `strict` | force strict even on a bare apex |
-| `--single` | `single` | no enum, no URL filtering (just probe the one host) |
-| `--apex` | `apex` | force full subdomain enum even on a subdomain target |
+Override with `--strict`, `--single`, or `--apex` when needed.
 
 ---
 
-## Output
+## Output Structure
 
-Everything lands under `output/<target>_<timestamp>/`. On `--resume`, the previous directory is reused and `recon.log` + `.state` are **appended to**, not overwritten.
-
-The final `report/report.txt` shows a summary, a **crawl map** (URL path tree grouped by host), and an ASCII file tree of everything produced:
+Everything lands in `output/<target>_<timestamp>/`. Using `--resume` reuses the same directory.
 
 ```
 output/example.com_20260615_142301/
 ├── recon.log                              full ANSI-stripped log
-├── .state                                 resume bookmarks (one module name per line)
+├── .state                                 resume bookmarks
 ├── subdomains/
-│   └── subs.txt                           in-scope hosts
+│   └── subs.txt                           discovered hosts
 ├── http/
-│   ├── live_urls.txt                      all live URLs (status + tech)
-│   ├── clean_urls.txt                     challenge-free URLs (used by nuclei / fuzz / crawl)
-│   ├── challenged.txt                     hosts behind Cloudflare / Akamai / etc.
-│   └── interesting.txt                    high-value services (Jenkins, Grafana, …)
+│   ├── live_urls.txt                      live URLs with status + tech
+│   ├── clean_urls.txt                     WAF/CDN-free URLs (used by active tools)
+│   ├── challenged.txt                     hosts behind edge protection
+│   └── interesting.txt                    high-value services (Jenkins, Grafana…)
 ├── origin/
-│   └── confirmed_origins.txt              verified backend IPs (CDN bypassed)
+│   └── confirmed_origins.txt              verified backend IPs
 ├── ports/
-│   ├── ports.txt                          open ports (host:port)
-│   └── high_interest.txt                  high-risk ports (Docker, Redis, Elastic …)
+│   ├── ports.txt                          open ports
+│   └── high_interest.txt                  high-risk ports
 ├── urls/
-│   ├── urls.txt                           full URL archive (katana + wayback + gau + gospider)
-│   ├── gospider.txt                       URLs discovered by gospider spider
-│   └── interesting_files.txt             .env / .bak / .sql / .js / .log URLs
+│   ├── urls.txt                           full URL archive
+│   ├── site_tree.txt                      URL path tree grouped by host
+│   └── interesting_files.txt              .env / .bak / .sql / .log URLs
 ├── js/
-│   ├── js_urls.txt                        JS file URLs collected (katana crawl + subjs)
-│   ├── subjs_urls.txt                     additional JS URLs discovered by subjs
-│   ├── potential_secrets.txt              secret hits (jsluice / trufflehog / gitleaks / regex)
-│   ├── endpoints.txt                      API endpoints extracted from JS (jsluice + regex)
-│   ├── sinks.txt                          DOM XSS sink patterns (innerHTML, eval, document.write …)
-│   ├── sourcemaps.txt                     source map references (exposed .map files)
-│   ├── technologies.txt                   technology fingerprints found in JS
-│   ├── admin_routes.txt                   admin / internal route strings in JS
-│   ├── cloud_assets.txt                   cloud storage URLs / ARNs found in JS
-│   ├── subdomains.txt                     subdomains discovered via JS analysis
-│   ├── js_params.txt                      parameter names extracted from JS
-│   ├── comments.txt                       inline JS comments with sensitive patterns
-│   ├── html_comments.txt                  HTML page comments with sensitive patterns
-│   └── graphql.txt                        GraphQL schema / query patterns in JS
+│   ├── potential_secrets.txt              API keys, tokens, credentials
+│   ├── endpoints.txt                      API paths extracted from JS
+│   ├── sinks.txt                          DOM XSS sinks (innerHTML, eval…)
+│   ├── sourcemaps.txt                     exposed .map file references
+│   ├── admin_routes.txt                   internal/admin routes in JS
+│   ├── cloud_assets.txt                   S3/GCS/Azure URLs in JS
+│   ├── technologies.txt                   fingerprinted tech stack
+│   ├── page_js_map.json                   which pages load which JS files
+│   └── …
 ├── fuzz/
-│   └── findings.txt                       aggregated ffuf discovery results
+│   └── findings.txt                       directory bruteforce results
 ├── params/
-│   ├── parameterized.txt                  URLs with query parameters
 │   ├── ssrf_params.txt                    SSRF candidates
-│   └── nuclei_ssrf.txt                    nuclei SSRF probe results (if any)
+│   ├── idor_params.txt                    IDOR candidates
+│   ├── lfi_params.txt                     LFI candidates
+│   └── redirect_params.txt                open redirect candidates
 ├── nuclei/
-│   ├── findings.txt                       all unique vuln findings (deduped)
+│   ├── findings.txt                       all findings (deduped)
 │   ├── cves.txt                           CVE matches
-│   ├── exposures.txt                      exposure findings
-│   └── misconfig.txt                      misconfig findings
+│   └── misconfig.txt                      misconfigurations
 ├── bypass403/
 │   └── bypassed.txt                       confirmed 403 bypasses
 ├── xss/
 │   └── dalfox_results.txt                 XSS findings
-├── dorks/
-│   ├── google_dorks.txt                   ready-to-paste Google dork queries
-│   └── github_dorks.txt                   ready-to-paste GitHub dork queries
-├── cloud/
-│   ├── bucket_names.txt                   generated bucket name permutations
-│   ├── s3_raw.txt                         raw s3scanner output (preserved for debug)
-│   ├── s3_results.txt                     noise-filtered bucket scan results
-│   └── open_buckets.txt                   publicly accessible buckets
 ├── headers/
 │   ├── cors_issues.txt                    CORS misconfigurations
 │   └── host_injection.txt                 host-header injection hits
 ├── graphql/
-│   ├── endpoints.txt                      discovered GraphQL endpoints
-│   └── introspection_enabled.txt          endpoints with introspection on
+│   ├── endpoints.txt                      GraphQL endpoints
+│   └── introspection_enabled.txt          introspection-enabled endpoints
 ├── ssl/
-│   └── issues.txt                         cert expiry + deprecated protocols
+│   └── issues.txt                         cert expiry + TLS issues
 └── report/
-    ├── report.txt                         prioritized WHERE TO START + file tree
-    └── report.html                        interactive HTML report (electric terminal theme)
+    ├── report.txt                         text summary + site tree + file tree
+    └── report.html                        interactive HTML report
 ```
 
 ---
 
 ## Installation
 
+### Automated
+
 ```bash
-./install.sh                 # core + recommended  (builds tanya binary)
+./install.sh                 # core + recommended tools
 ./install.sh --optional      # + optional tools
-./install.sh --seclists      # + SecLists → ~/SecLists
+./install.sh --seclists      # + SecLists wordlists
 ./install.sh --all           # everything
-./install.sh --minimal       # core only (Go + build)
+./install.sh --minimal       # Go + build only
 ```
 
 ### Manual build
 
+Requires Go 1.22+.
+
 ```bash
-# Requires Go 1.22+
 go mod tidy
 go build -ldflags="-s -w" -o tanya .
 ./tanya --help
-# or: make check   (runs go vet then build)
 ```
 
-### Manual tool install
+### Requirements
 
-```bash
-# ProjectDiscovery suite
-go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-go install github.com/projectdiscovery/katana/cmd/katana@latest
-go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-go install github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
-go install github.com/projectdiscovery/chaos-client/cmd/chaos@latest
+| Requirement | Notes |
+|-------------|-------|
+| Go 1.22+ | Build only — not needed at runtime |
+| Linux, macOS, or WSL 2 | Binary targets |
+| `python3` | HTML report generation |
+| `curl` | Used by install script |
 
-# Fuzzing / crawling / archive
-go install github.com/ffuf/ffuf/v2@latest
-go install github.com/tomnomnom/waybackurls@latest
-go install github.com/lc/gau/v2/cmd/gau@latest
-go install github.com/jaeles-project/gospider@latest
-
-# JS analysis
-go install github.com/BishopFox/jsluice/cmd/jsluice@latest
-go install github.com/lc/subjs@latest
-
-# Bug bounty
-go install github.com/hahwul/dalfox/v2@latest
-go install github.com/PentestPad/subzy@latest
-go install github.com/tomnomnom/gf@latest
-go install github.com/gitleaks/gitleaks/v8@latest
-go install github.com/sa7mon/s3scanner@latest
-```
+All recon tools are optional — missing tools produce a warning and the relevant module is skipped.
 
 ---
 
 ## Configuration
 
-`config.env` sits next to the binary and is loaded at startup. All keys are optional.
+`config.env` lives next to the binary and is loaded automatically. All fields are optional.
 
 ```bash
-# Threading & rate limits
+# Threading and rate limits
 HTTPX_THREADS=100
 NAABU_THREADS=200
 NAABU_RATE=2000
 FFUF_THREADS=100
 KATANA_DEPTH=5
 
-# Nuclei tuning
-# NUCLEI_RATE=150
-# NUCLEI_CONC=25
-
 # Wordlists
 FFUF_WORDLIST="$HOME/SecLists/Discovery/Web-Content/common.txt"
 
-# API keys  (blank = feature silently skipped)
+# API keys (leave blank to silently skip the feature)
 SECURITYTRAILS_API_KEY=""
 SHODAN_API_KEY=""
 ```
 
 ---
 
-## File structure
+## HTML Report
+
+Running `R` in the TUI or `./tanya <target> --module report` generates:
+
+- `report.txt` — plain text summary, URL path tree, file tree
+- `report.html` — self-contained interactive report (no CDN, works offline)
+
+The HTML report includes:
+- Severity-weighted triage card (where to start)
+- All findings grouped by type with one-click copy
+- Site URL tree showing the target's path structure
+- Page → JS file mapping (expand any page to see its scripts)
+- Force-directed attack surface graph
+- Full-text search across all sections
+
+On WSL, the report path is printed as `\\wsl.localhost\...` so you can open it directly in a Windows browser.
+
+---
+
+## Project Structure
 
 ```
 Tanya/
-├── main.go                entry point + CLI flags + banner
+├── main.go                    entry point, CLI flags, banner
 ├── go.mod / go.sum
-├── Makefile               build / vet / install targets
+├── Makefile
 ├── internal/
-│   ├── config/config.go   Config struct + config.env loader
-│   ├── target/target.go   target parsing, PaaS detection, scope modes (apex/single/strict)
-│   ├── state/state.go     thread-safe .state file for resume + MarkUndone
-│   ├── runner/runner.go   exec helpers, file helpers, ANSI output
-│   ├── modules/modules.go all 17 modules as methods on *Ctx + RunCategory
-│   └── tui/tui.go         Bubbletea model + lipgloss view
-├── tanya_report.py        interactive HTML report generator (python3, electric theme)
-├── config.env             optional overrides (auto-created by install.sh)
-└── install.sh             dependency installer
+│   ├── config/config.go       config struct + config.env loader
+│   ├── target/target.go       target parsing, PaaS detection, scope modes
+│   ├── state/state.go         thread-safe resume state
+│   ├── runner/runner.go       subprocess helpers, file helpers, output
+│   ├── modules/modules.go     all 17 modules
+│   └── tui/tui.go             Bubbletea TUI
+├── tanya_report.py            HTML report generator
+├── config.env                 runtime overrides
+└── install.sh                 dependency installer
 ```
 
 ---
 
-## Requirements
+## Roadmap
 
-- Go 1.22+ (to build)
-- Linux, macOS, or WSL 2 (binary targets)
-- `curl` and `jq` — all other recon tools degrade gracefully when absent
-- `python3` — for HTML report generation (`tanya_report.py`)
+- [ ] Headless browser integration for DOM-based XSS testing (hash fragment sinks)
+- [ ] Authenticated scanning via cookie or header auth in config
+- [ ] Differential scanning — compare two runs and show what changed
+- [ ] Nuclei false-positive filtering layer
+- [ ] Secret scanning extended to HTML pages and JSON API responses
+- [ ] HTTP method fuzzing in parameter discovery
+
+---
+
+## Contributing
+
+Bug reports and pull requests are welcome. A few ground rules:
+
+- Keep modules self-contained — each module should clean up after itself and work when run in isolation via `--module`
+- New tools should degrade gracefully when not installed
+- The binary must build with `go build ./...` with no warnings
 
 ---
 
 ## Disclaimer
 
-This tool automates active reconnaissance against remote systems. Running it against targets you do not own or are not authorized to test may be illegal in your jurisdiction. Use it only within the scope of a sanctioned engagement — a bug bounty program, a signed pentest agreement, or your own infrastructure. The authors assume no liability for misuse.
+This tool makes active network requests against remote systems. Running it against targets you do not own or are not authorized to test is illegal and will get you banned from bug bounty programs. Use it only within scope — a bug bounty program you're enrolled in, a signed pentest agreement, or your own infrastructure.

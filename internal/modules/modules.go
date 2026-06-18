@@ -1443,8 +1443,90 @@ func (c *Ctx) RunJS() error {
 	if len(htmlComments) > 0 {
 		runner.Info("HTML page comments → %s", filepath.Join(dir, "html_comments.txt"))
 	}
+	// Build page → JS map: which HTML pages load which JS files
+	runner.Info("Mapping pages to JS files…")
+	pageJSMap := buildPageJSMap(c, filepath.Join(c.OutDir, "http", "live_urls.txt"))
+	if len(pageJSMap) > 0 {
+		if data, err := json.Marshal(pageJSMap); err == nil {
+			os.WriteFile(filepath.Join(dir, "page_js_map.json"), data, 0644)
+			runner.OK("Page→JS map: %d page(s) mapped", len(pageJSMap))
+		}
+	}
+
 	c.St.MarkDone("js")
 	return nil
+}
+
+type pageJSEntry struct {
+	Page    string   `json:"page"`
+	Scripts []string `json:"scripts"`
+}
+
+var scriptSrcRe = regexp.MustCompile(`(?i)<script[^>]+src\s*=\s*["']([^"']+)["']`)
+
+func buildPageJSMap(c *Ctx, liveURLsFile string) []pageJSEntry {
+	lines, _ := runner.ReadLines(liveURLsFile)
+	if len(lines) == 0 {
+		return nil
+	}
+	var mu sync.Mutex
+	var results []pageJSEntry
+	sem := make(chan struct{}, 10)
+	var wg sync.WaitGroup
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	for _, pageURL := range lines {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			req, err := http.NewRequest("GET", u, nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("User-Agent", c.Cfg.CurlUA)
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "html") {
+				return
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			matches := scriptSrcRe.FindAllSubmatch(body, -1)
+			if len(matches) == 0 {
+				return
+			}
+			base, err := url.Parse(u)
+			if err != nil {
+				return
+			}
+			seen := make(map[string]bool)
+			var scripts []string
+			for _, m := range matches {
+				ref, err := url.Parse(string(m[1]))
+				if err != nil {
+					continue
+				}
+				abs := base.ResolveReference(ref).String()
+				if !seen[abs] {
+					seen[abs] = true
+					scripts = append(scripts, abs)
+				}
+			}
+			if len(scripts) > 0 {
+				mu.Lock()
+				results = append(results, pageJSEntry{Page: u, Scripts: scripts})
+				mu.Unlock()
+			}
+		}(pageURL)
+	}
+	wg.Wait()
+	sort.Slice(results, func(i, j int) bool { return results[i].Page < results[j].Page })
+	return results
 }
 
 // ── MODULE 7: Directory Bruteforce ───────────────────────────
@@ -2507,6 +2589,17 @@ func (c *Ctx) RunReport() error {
 	return nil
 }
 
+// wslDisplayPath returns the Windows-accessible \\wsl.localhost\... path when
+// running inside WSL, so the user can open it directly from Windows Explorer or
+// a browser. Falls back to the original Linux path if wslpath is unavailable.
+func wslDisplayPath(linuxPath string) string {
+	out, err := exec.Command("wslpath", "-w", linuxPath).Output()
+	if err != nil {
+		return linuxPath
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func (c *Ctx) RunHTMLReport() error {
 	gen := filepath.Join(c.ScriptDir, "tanya_report.py")
 	if _, err := os.Stat(gen); err != nil {
@@ -2523,7 +2616,7 @@ func (c *Ctx) RunHTMLReport() error {
 	cmd := c.cmd("python3", gen, c.OutDir, "--target", c.Tgt.Host,
 		"--scope", string(c.Tgt.ScopeMode), "--out", out)
 	if err := runner.RunTool("python3", c.LogFile, cmd); err == nil {
-		runner.OK("Interactive report → %s", out)
+		runner.OK("Interactive report → %s", wslDisplayPath(out))
 	} else {
 		runner.Warn("HTML report generation failed (see log)")
 	}

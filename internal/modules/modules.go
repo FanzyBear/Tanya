@@ -889,7 +889,11 @@ var singleLineCommentRe = regexp.MustCompile(`//[^\r\n]{4,}`)
 var multiLineCommentRe = regexp.MustCompile(`(?s)/\*.*?\*/`)
 var sourceMapURLRe = regexp.MustCompile(`(?i)//[#@]\s*source(?:Mapping)?URL\s*=\s*(\S+)`)
 var jsParamURLRe   = regexp.MustCompile(`[?&]([a-zA-Z_][a-zA-Z0-9_\-]{0,40})\s*=`)
-var adminRouteRe   = regexp.MustCompile(`(?i)['"/](?:admin|administrator|dashboard|management|internal|private|debug|superuser|staff|backoffice|panel|control-panel|cp|mgmt|sysadmin|monitoring|metrics|config|settings|setup)[/?'"\s#]`)
+// adminRouteRe matches path-shaped strings whose first segment is a strong
+// admin/internal indicator, e.g. "/admin/users" or "/wp-admin". Requiring a
+// leading slash and a specific keyword keeps out the noise the old broad
+// word-anywhere pattern produced (every "config"/"settings"/"cp" in a bundle).
+var adminRouteRe   = regexp.MustCompile(`(?i)/(?:admin|administrator|adminpanel|backoffice|control-panel|controlpanel|dashboard|management|phpmyadmin|superuser|sysadmin|wp-admin)(?:/[a-zA-Z0-9_.\-]+){0,4}/?`)
 var gqlInJSRe      = regexp.MustCompile(`(?i)(?:useQuery|useMutation|useSubscription|ApolloClient|createHttpLink|InMemoryCache|graphql-tag)\s*\(|/graphql['")\s]`)
 
 var techPatterns = map[string]*regexp.Regexp{
@@ -1091,61 +1095,73 @@ func (c *Ctx) RunJS() error {
 	sort.Strings(endpoints)
 	runner.WriteLines(filepath.Join(dir, "endpoints.txt"), endpoints)
 
-	// Source map detection
+	// Source map detection.
+	// A bundle exposes its source map two ways: an explicit
+	// //# sourceMappingURL= comment, or a conventional "<file>.js.map"
+	// sibling that minifiers deploy but strip the comment for. We resolve the
+	// referenced map first, then fall back to guessing the sibling, and only
+	// probe each candidate URL once. The actionable finding is an EXPOSED map
+	// (fetchable and carrying original "sources"), so that's what we headline.
 	runner.Info("Source map detection…")
 	var smapLines []string
+	var exposed int
 	smclient := &http.Client{Timeout: 10 * time.Second}
+	probed := make(map[string]bool)
 	for _, fpath := range jsFilePaths {
-		content, _ := os.ReadFile(fpath)
-		m := sourceMapURLRe.FindSubmatch(content)
-		if m == nil {
-			continue
-		}
-		mapRef := strings.TrimSpace(string(m[1]))
-		if strings.HasPrefix(mapRef, "data:") {
-			continue
-		}
 		origURL := urlByAbsPath[fpath]
-		mapURL := mapRef
-		if !strings.HasPrefix(mapRef, "http") && origURL != "" {
-			if base, err := url.Parse(origURL); err == nil {
-				if ref, err2 := url.Parse(mapRef); err2 == nil {
-					mapURL = base.ResolveReference(ref).String()
+		content, _ := os.ReadFile(fpath)
+
+		// Candidate map URL: explicit reference, else guessed sibling.
+		mapURL := ""
+		if m := sourceMapURLRe.FindSubmatch(content); m != nil {
+			mapRef := strings.TrimSpace(string(m[1]))
+			if strings.HasPrefix(mapRef, "data:") {
+				continue // inline map, nothing remote to fetch
+			}
+			mapURL = mapRef
+			if !strings.HasPrefix(mapRef, "http") && origURL != "" {
+				if base, err := url.Parse(origURL); err == nil {
+					if ref, err2 := url.Parse(mapRef); err2 == nil {
+						mapURL = base.ResolveReference(ref).String()
+					}
 				}
 			}
+		} else if origURL != "" {
+			mapURL = origURL + ".map"
 		}
+		if mapURL == "" || probed[mapURL] {
+			continue
+		}
+		probed[mapURL] = true
+
 		req, err := http.NewRequest("GET", mapURL, nil)
 		if err != nil {
-			smapLines = append(smapLines, fmt.Sprintf("[ref-only] %s → %s", origURL, mapRef))
 			continue
 		}
 		req.Header.Set("User-Agent", c.Cfg.CurlUA)
 		resp, err := smclient.Do(req)
 		if err != nil {
-			smapLines = append(smapLines, fmt.Sprintf("[unreachable] %s → %s", origURL, mapURL))
 			continue
 		}
 		smapBody, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 		resp.Body.Close()
-		if resp.StatusCode == 200 {
-			var sm struct {
-				Sources []string `json:"sources"`
+		if resp.StatusCode != 200 {
+			continue
+		}
+		var sm struct {
+			Sources []string `json:"sources"`
+		}
+		if json.Unmarshal(smapBody, &sm) == nil && len(sm.Sources) > 0 {
+			exposed++
+			smapLines = append(smapLines, fmt.Sprintf("[EXPOSED %d sources] %s", len(sm.Sources), mapURL))
+			for _, src := range sm.Sources {
+				smapLines = append(smapLines, "  src: "+src)
 			}
-			if json.Unmarshal(smapBody, &sm) == nil && len(sm.Sources) > 0 {
-				smapLines = append(smapLines, fmt.Sprintf("[EXPOSED %d sources] %s", len(sm.Sources), mapURL))
-				for _, src := range sm.Sources {
-					smapLines = append(smapLines, "  src: "+src)
-				}
-			} else {
-				smapLines = append(smapLines, fmt.Sprintf("[accessible] %s → %s", origURL, mapURL))
-			}
-		} else {
-			smapLines = append(smapLines, fmt.Sprintf("[%d] %s → %s", resp.StatusCode, origURL, mapURL))
 		}
 	}
 	runner.WriteLines(filepath.Join(dir, "sourcemaps.txt"), smapLines)
-	if len(smapLines) > 0 {
-		runner.Warn("Source maps detected → %s", filepath.Join(dir, "sourcemaps.txt"))
+	if exposed > 0 {
+		runner.Warn("Exposed source maps: %d → %s", exposed, filepath.Join(dir, "sourcemaps.txt"))
 	}
 
 	// Technology fingerprinting
@@ -1854,7 +1870,12 @@ func (c *Ctx) RunTakeover() error {
 	if runner.HasTool("subzy") {
 		runner.Info("subzy: checking %d subdomains…", runner.CountLines(subs))
 		out := filepath.Join(dir, "takeovers.txt")
-		cmd := c.cmd("subzy", "run", "--targets", subs, "--concurrency", "40", "--timeout", "10")
+		// --vuln + --hide_fails keep only confirmed-vulnerable subdomains in the
+		// output; without them subzy dumps every checked host and the count below
+		// reports the whole list as "vulnerable".
+		cmd := c.cmd("subzy", "run", "--targets", subs,
+			"--concurrency", "40", "--timeout", "10",
+			"--vuln", "--hide_fails")
 		runner.RunToolStdout("subzy", out, c.LogFile, cmd)
 		runner.OK("subzy: %d vulnerable", runner.CountLines(out))
 	} else {
@@ -2040,8 +2061,14 @@ func (c *Ctx) RunXSS() error {
 
 	out := filepath.Join(dir, "dalfox_results.txt")
 	runner.Info("dalfox: scanning %d URL(s)…", runner.CountLines(targets))
+	// dalfox is noisy by default. --skip-bav drops the "basic another
+	// vulnerability" grepping (SQLi/SSTI/CRLF/open-redirect guesses) that
+	// produces most of the false alerts, --skip-grepping disables built-in
+	// pattern matches, and --only-poc=r,v limits output to reflected and
+	// verified proof-of-concepts instead of low-confidence grep hits.
 	cmd := c.cmd("dalfox", "file", targets,
 		"--no-spinner", "--user-agent", c.Cfg.BrowserUA, "--timeout", "10",
+		"--skip-bav", "--skip-grepping", "--only-poc", "r,v",
 		"-o", out)
 	runner.RunTool("dalfox", c.LogFile, cmd)
 	os.Remove(targets)

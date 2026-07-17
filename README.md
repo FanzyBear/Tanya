@@ -11,7 +11,7 @@
 
 <p align="center">
   <b>Bug Bounty Web Recon Pipeline</b><br>
-  v6.2 &nbsp;·&nbsp; Go + Bubbletea TUI &nbsp;·&nbsp; 17 modules &nbsp;·&nbsp; Authorized targets only
+  v6.3 &nbsp;·&nbsp; Go + Bubbletea TUI &nbsp;·&nbsp; 17 modules &nbsp;·&nbsp; Authorized targets only
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@ No Docker. No config files required. No Python dependency hell. Build once, run 
 - **Automatic scope detection** — apex, strict, single-host, and PaaS modes auto-selected from the target you provide
 - **CDN/WAF-aware** — detects Cloudflare, Akamai, Imperva, DataDome, PerimeterX, AWS WAF; separates challenged hosts from clean targets so your tools run against the right surface
 - **Origin IP discovery** — finds real backend IPs behind CDNs for direct-connect scanning
-- **Comprehensive JS recon** — endpoints, DOM XSS sinks, secrets, source maps, admin routes, cloud assets, tech fingerprinting, page→JS mapping
+- **Comprehensive JS recon** — endpoints, DOM XSS sinks, secrets, source-map reconstruction (recovers original sources), admin routes, cloud assets, tech fingerprinting, page→JS mapping
 - **Concurrent 403 bypass** — 15 goroutines testing header tricks and path variants in parallel
 - **Resume support** — restart a scan exactly where it left off
 - **Interactive HTML report** — attack surface graph, triage section, search, WSL-aware paths
@@ -71,7 +71,7 @@ git clone https://github.com/FanzyBear/Tanya.git && cd Tanya
 
 ```
   ──────────────────────────────────────────────────────────────────────────────
-   ◆ TANYA  v6.2  ›  example.com  [apex]                      9/17  ██████░░  52%
+   ◆ TANYA  v6.3  ›  example.com  [apex]                      9/17  ██████░░  52%
      output/example.com_20260615_142301
   ──────────────────────────────────────────────────────────────────────────────
 
@@ -83,13 +83,17 @@ git clone https://github.com/FanzyBear/Tanya.git && cd Tanya
   ◆ ATTACK ─────────────────────────────────────────────────────────────────────
 
   ✓  7  Dir Bruteforce    ✓  8  Params + CORS       ▶  9  Vuln Scan
-    10  Sub Takeover        11  403 Bypass             12  XSS Scan
+    10  Sub Takeover      ✗ 11  403 Bypass             12  XSS Scan
 
   ──────────────────────────────────────────────────────────────────────────────
   subs:247  live:89  nuclei:12  secrets:3  xss:0  bypass:2  graphql:0  ssl:1
   ──────────────────────────────────────────────────────────────────────────────
-  ↑↓/jk nav  ↵ run  tab cat  g/G first/last  F full  R report  D deps  Q quit
+  ↑↓/jk nav  ↵ run  tab cat  g/G first/last  F full  R report  D deps  ? help  Q quit
 ```
+
+Status symbols: `▶` selected · `✓` done · `✗` failed (see `recon.log`) · `·` pending.
+Press `?` for a full keybinding overlay. A selected module shows `needs: <module>`
+when a prerequisite hasn't run yet.
 
 ---
 
@@ -102,13 +106,13 @@ git clone https://github.com/FanzyBear/Tanya.git && cd Tanya
 | 3 | **Origin Discovery** | CDN vs origin classification, direct-connect verification | cdncheck, dnsx |
 | 4 | **Port Scanning** | Top-1000 ports + high-risk flagging (Docker, Redis, Elastic, etcd…) | naabu |
 | 5 | **URL Collection** | Crawl + archive; interesting file detection; URL path tree | katana, waybackurls, gau, gospider |
-| 6 | **JS Recon** | Endpoints, DOM sinks, secrets, source maps, admin routes, cloud assets, tech, page→JS map | jsluice, subjs, trufflehog, gitleaks |
+| 6 | **JS Recon** | Endpoints, DOM sinks, secrets, source-map reconstruction (recovers original sources), admin routes, cloud assets, tech, page→JS map | jsluice, subjs, trufflehog, gitleaks |
 | 7 | **Dir Bruteforce** | Content discovery against live URLs | ffuf |
 | 8 | **Params + CORS** | Parameter classification (SSRF/IDOR/LFI/redirect), CORS deep-check, SSRF probe | arjun, nuclei |
 | 9 | **Vuln Scan** | CVEs, exposures, misconfigs; CDN-aware; challenged host slow-pass | nuclei |
-| 10 | **Sub Takeover** | CNAME dangling detection + takeover templates | subzy, nuclei |
+| 10 | **Sub Takeover** | Native CNAME + fingerprint detection (works tool-free): CONFIRMED / DANGLING / POTENTIAL, cross-checked with subzy + takeover templates | built-in, subzy, nuclei |
 | 11 | **403 Bypass** | Header tricks + path variants, 15 goroutines in parallel | stdlib |
-| 12 | **XSS Scan** | Reflected + DOM XSS via gf pre-filter | dalfox, gf |
+| 12 | **XSS Scan** | Reflected + DOM XSS; dedupes by param signature, caps volume, POC-only output to cut noise | dalfox, gf |
 | 13 | **Dorks** | Scoped Google + GitHub dork queries ready to paste | — |
 | 14 | **Cloud Buckets** | Bucket permutation + public access check | s3scanner |
 | 15 | **Header Audit** | Security headers, host-header injection, CORS | nuclei, stdlib |
@@ -205,7 +209,8 @@ output/example.com_20260615_142301/
 │   ├── potential_secrets.txt              API keys, tokens, credentials
 │   ├── endpoints.txt                      API paths extracted from JS
 │   ├── sinks.txt                          DOM XSS sinks (innerHTML, eval…)
-│   ├── sourcemaps.txt                     exposed .map file references
+│   ├── sourcemaps.txt                     exposed .map files (+ recovered count)
+│   ├── recovered/                         original sources rebuilt from .map
 │   ├── admin_routes.txt                   internal/admin routes in JS
 │   ├── cloud_assets.txt                   S3/GCS/Azure URLs in JS
 │   ├── technologies.txt                   fingerprinted tech stack
@@ -224,8 +229,12 @@ output/example.com_20260615_142301/
 │   └── misconfig.txt                      misconfigurations
 ├── bypass403/
 │   └── bypassed.txt                       confirmed 403 bypasses
+├── takeover/
+│   ├── takeovers.txt                      CONFIRMED / DANGLING / POTENTIAL
+│   └── cnames.txt                         resolved CNAME map (host → target)
 ├── xss/
-│   └── dalfox_results.txt                 XSS findings
+│   ├── dalfox_results.txt                 XSS proof-of-concept findings
+│   └── dalfox_raw.txt                     unfiltered dalfox output
 ├── headers/
 │   ├── cors_issues.txt                    CORS misconfigurations
 │   └── host_injection.txt                 host-header injection hits

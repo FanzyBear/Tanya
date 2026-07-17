@@ -1,4 +1,4 @@
-// tanya — Bug Bounty Web Recon Pipeline v6.2
+// tanya — Bug Bounty Web Recon Pipeline v6.3
 //
 // Usage:
 //   tanya <target>                   interactive full-screen TUI
@@ -311,7 +311,7 @@ func printModuleHeader(module, outDir string) {
 	const d = "\033[2m"
 	const z = "\033[0m"
 	const b = "\033[1m"
-	fmt.Printf("\n%s◆ TANYA%s  %sv6.2%s  %s›%s  %s%s%s\n",
+	fmt.Printf("\n%s◆ TANYA%s  %sv6.3%s  %s›%s  %s%s%s\n",
 		bc, z, d, z, bc, z, b, strings.ToUpper(module), z)
 	fmt.Printf("%s  %s%s\n\n", d, filepath.Base(outDir), z)
 	fmt.Printf("%s%s%s\n\n", d, strings.Repeat("─", 60), z)
@@ -332,7 +332,7 @@ func printBanner() {
 	fmt.Printf(c+"     ██║   ██║  ██║██║ ╚████║   ██║    ██║  ██║"+z+"             "+d+"`-    \\`_`\"'-"+z+"\n")
 	fmt.Printf(d+"     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═╝  ╚═╝"+z+"\n")
 	fmt.Println()
-	fmt.Printf(bc+"  Bug Bounty Web Recon Pipeline"+z+"  "+c+"v6.2"+z+"\n")
+	fmt.Printf(bc+"  Bug Bounty Web Recon Pipeline"+z+"  "+c+"v6.3"+z+"\n")
 	fmt.Printf(d+"  web-focused · txt/jsonl output · authorized targets only"+z+"\n")
 	fmt.Println()
 }

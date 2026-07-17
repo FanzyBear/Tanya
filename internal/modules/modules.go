@@ -889,7 +889,11 @@ var singleLineCommentRe = regexp.MustCompile(`//[^\r\n]{4,}`)
 var multiLineCommentRe = regexp.MustCompile(`(?s)/\*.*?\*/`)
 var sourceMapURLRe = regexp.MustCompile(`(?i)//[#@]\s*source(?:Mapping)?URL\s*=\s*(\S+)`)
 var jsParamURLRe   = regexp.MustCompile(`[?&]([a-zA-Z_][a-zA-Z0-9_\-]{0,40})\s*=`)
-var adminRouteRe   = regexp.MustCompile(`(?i)['"/](?:admin|administrator|dashboard|management|internal|private|debug|superuser|staff|backoffice|panel|control-panel|cp|mgmt|sysadmin|monitoring|metrics|config|settings|setup)[/?'"\s#]`)
+// adminRouteRe captures a full quoted route path that contains an
+// admin/internal keyword segment (group 1), e.g. "/admin/users" or
+// "/internal/debug". Requiring the leading slash + quotes drops the noise
+// the old keyword-only pattern produced (bare "cp", "config", …).
+var adminRouteRe = regexp.MustCompile(`(?i)["'](/[a-z0-9_\-./]*(?:admin|administrator|dashboard|management|internal|superuser|backoffice|sysadmin|moderator|control[-_]panel|/debug|/settings|/config)[a-z0-9_\-./]*)["']`)
 var gqlInJSRe      = regexp.MustCompile(`(?i)(?:useQuery|useMutation|useSubscription|ApolloClient|createHttpLink|InMemoryCache|graphql-tag)\s*\(|/graphql['")\s]`)
 
 var techPatterns = map[string]*regexp.Regexp{
@@ -1091,61 +1095,91 @@ func (c *Ctx) RunJS() error {
 	sort.Strings(endpoints)
 	runner.WriteLines(filepath.Join(dir, "endpoints.txt"), endpoints)
 
-	// Source map detection
-	runner.Info("Source map detection…")
+	// Source map detection + original-source reconstruction.
+	// For each JS file we resolve its .map (from the //# sourceMappingURL
+	// comment, or a <file>.js.map sibling fallback) and, when the map is
+	// readable, recover the original pre-minified sources from sourcesContent
+	// to js/recovered/ — the highest-value artefact a source map leaks.
+	runner.Info("Source map detection + reconstruction…")
+	recoveredDir := filepath.Join(dir, "recovered")
 	var smapLines []string
-	smclient := &http.Client{Timeout: 10 * time.Second}
+	smapSeen := make(map[string]bool)
+	totalRecovered := 0
+	smclient := &http.Client{Timeout: 12 * time.Second}
 	for _, fpath := range jsFilePaths {
 		content, _ := os.ReadFile(fpath)
-		m := sourceMapURLRe.FindSubmatch(content)
-		if m == nil {
-			continue
-		}
-		mapRef := strings.TrimSpace(string(m[1]))
-		if strings.HasPrefix(mapRef, "data:") {
-			continue
-		}
 		origURL := urlByAbsPath[fpath]
-		mapURL := mapRef
-		if !strings.HasPrefix(mapRef, "http") && origURL != "" {
-			if base, err := url.Parse(origURL); err == nil {
-				if ref, err2 := url.Parse(mapRef); err2 == nil {
-					mapURL = base.ResolveReference(ref).String()
+
+		// Candidate map URLs: explicit comment first, then .map sibling.
+		var mapCandidates []string
+		if m := sourceMapURLRe.FindSubmatch(content); m != nil {
+			mapRef := strings.TrimSpace(string(m[1]))
+			if !strings.HasPrefix(mapRef, "data:") {
+				mapURL := mapRef
+				if !strings.HasPrefix(mapRef, "http") && origURL != "" {
+					if base, err := url.Parse(origURL); err == nil {
+						if ref, err2 := url.Parse(mapRef); err2 == nil {
+							mapURL = base.ResolveReference(ref).String()
+						}
+					}
 				}
+				mapCandidates = append(mapCandidates, mapURL)
 			}
 		}
-		req, err := http.NewRequest("GET", mapURL, nil)
-		if err != nil {
-			smapLines = append(smapLines, fmt.Sprintf("[ref-only] %s → %s", origURL, mapRef))
-			continue
+		if origURL != "" {
+			if u, err := url.Parse(origURL); err == nil {
+				u.Path = u.Path + ".map"
+				mapCandidates = append(mapCandidates, u.String())
+			}
 		}
-		req.Header.Set("User-Agent", c.Cfg.CurlUA)
-		resp, err := smclient.Do(req)
-		if err != nil {
-			smapLines = append(smapLines, fmt.Sprintf("[unreachable] %s → %s", origURL, mapURL))
-			continue
-		}
-		smapBody, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
-		resp.Body.Close()
-		if resp.StatusCode == 200 {
+
+		for _, mapURL := range mapCandidates {
+			if smapSeen[mapURL] {
+				continue
+			}
+			smapSeen[mapURL] = true
+
+			req, err := http.NewRequest("GET", mapURL, nil)
+			if err != nil {
+				continue
+			}
+			req.Header.Set("User-Agent", c.Cfg.CurlUA)
+			resp, err := smclient.Do(req)
+			if err != nil {
+				continue
+			}
+			smapBody, _ := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				continue
+			}
 			var sm struct {
-				Sources []string `json:"sources"`
+				Sources        []string `json:"sources"`
+				SourcesContent []string `json:"sourcesContent"`
 			}
-			if json.Unmarshal(smapBody, &sm) == nil && len(sm.Sources) > 0 {
-				smapLines = append(smapLines, fmt.Sprintf("[EXPOSED %d sources] %s", len(sm.Sources), mapURL))
-				for _, src := range sm.Sources {
-					smapLines = append(smapLines, "  src: "+src)
-				}
+			if json.Unmarshal(smapBody, &sm) != nil || len(sm.Sources) == 0 {
+				continue
+			}
+
+			nRec := c.reconstructSources(recoveredDir, mapURL, sm.Sources, sm.SourcesContent)
+			totalRecovered += nRec
+			if nRec > 0 {
+				smapLines = append(smapLines, fmt.Sprintf("[EXPOSED %d sources · %d recovered] %s", len(sm.Sources), nRec, mapURL))
 			} else {
-				smapLines = append(smapLines, fmt.Sprintf("[accessible] %s → %s", origURL, mapURL))
+				smapLines = append(smapLines, fmt.Sprintf("[EXPOSED %d sources · no sourcesContent] %s", len(sm.Sources), mapURL))
 			}
-		} else {
-			smapLines = append(smapLines, fmt.Sprintf("[%d] %s → %s", resp.StatusCode, origURL, mapURL))
+			for _, src := range sm.Sources {
+				smapLines = append(smapLines, "  src: "+src)
+			}
+			break // one map per JS file is enough
 		}
 	}
 	runner.WriteLines(filepath.Join(dir, "sourcemaps.txt"), smapLines)
 	if len(smapLines) > 0 {
-		runner.Warn("Source maps detected → %s", filepath.Join(dir, "sourcemaps.txt"))
+		runner.Warn("Source maps exposed → %s", filepath.Join(dir, "sourcemaps.txt"))
+	}
+	if totalRecovered > 0 {
+		runner.Warn("Recovered %d original source file(s) → %s", totalRecovered, recoveredDir)
 	}
 
 	// Technology fingerprinting
@@ -1247,11 +1281,16 @@ func (c *Ctx) RunJS() error {
 	adminSeen := make(map[string]bool)
 	for _, fpath := range jsFilePaths {
 		content, _ := os.ReadFile(fpath)
-		for _, ma := range adminRouteRe.FindAllString(string(content), -1) {
-			ma = strings.TrimSpace(ma)
-			if !adminSeen[ma] {
-				adminSeen[ma] = true
-				adminRoutes = append(adminRoutes, ma)
+		for _, ma := range adminRouteRe.FindAllStringSubmatch(string(content), -1) {
+			route := strings.TrimSpace(ma[1])
+			// Normalize: strip a trailing slash and any inline template markers.
+			route = strings.TrimRight(route, "/")
+			if route == "" || strings.Contains(route, "${") || strings.Contains(route, "//") {
+				continue
+			}
+			if !adminSeen[route] {
+				adminSeen[route] = true
+				adminRoutes = append(adminRoutes, route)
 			}
 		}
 	}
@@ -1836,6 +1875,52 @@ func (c *Ctx) RunNuclei() error {
 
 // ── MODULE 10: Subdomain Takeover ────────────────────────────
 
+// takeoverFP describes one dangling-service takeover signature.
+// cname is a substring of the resolved CNAME target that points at the
+// service; body is a string that appears on an unclaimed/dangling page.
+// vuln marks services where a matching fingerprint is a confirmed takeover
+// (vs. services that merely need manual verification).
+type takeoverFP struct {
+	service string
+	cname   []string
+	body    string
+	vuln    bool
+}
+
+var takeoverFingerprints = []takeoverFP{
+	{"GitHub Pages", []string{"github.io"}, "There isn't a GitHub Pages site here", true},
+	{"Heroku", []string{"herokudns.com", "herokuapp.com", "herokussl.com"}, "No such app", true},
+	{"AWS/S3", []string{"amazonaws.com", "s3-website"}, "NoSuchBucket", true},
+	{"Shopify", []string{"myshopify.com"}, "Sorry, this shop is currently unavailable", true},
+	{"Fastly", []string{"fastly.net"}, "Fastly error: unknown domain", true},
+	{"Ghost", []string{"ghost.io"}, "The thing you were looking for is no longer here", true},
+	{"Surge.sh", []string{"surge.sh"}, "project not found", true},
+	{"Bitbucket", []string{"bitbucket.io"}, "Repository not found", true},
+	{"Pantheon", []string{"pantheonsite.io"}, "The gods are wise, but do not know of the site", true},
+	{"Tumblr", []string{"domains.tumblr.com"}, "Whatever you were looking for doesn't currently exist at this address", true},
+	{"Wordpress", []string{"wordpress.com"}, "Do you want to register", true},
+	{"Webflow", []string{"proxy-ssl.webflow.com", "proxy.webflow.com"}, "The page you are looking for doesn't exist or has been moved", true},
+	{"Netlify", []string{"netlify.app", "netlify.com"}, "Not Found - Request ID", false},
+	{"ReadTheDocs", []string{"readthedocs.io"}, "unknown to Read the Docs", true},
+	{"Unbounce", []string{"unbouncepages.com"}, "The requested URL was not found on this server", true},
+	{"Zendesk", []string{"zendesk.com"}, "Help Center Closed", false},
+	{"Cargo", []string{"cargocollective.com"}, "404 Not Found", false},
+	{"Helpscout", []string{"helpscoutdocs.com"}, "No settings were found for this company", true},
+	{"Agile CRM", []string{"agilecrm.com"}, "Sorry, this page is no longer available", true},
+	{"Anima", []string{"animaapp.io"}, "If this is your website and you've just created it", true},
+	{"Kinsta", []string{"kinsta.cloud"}, "No Site For Domain", true},
+	{"Vercel", []string{"vercel.app", "vercel-dns.com"}, "The deployment could not be found", false},
+}
+
+// takeoverResult holds one host's takeover assessment.
+type takeoverResult struct {
+	host    string
+	cname   string
+	service string
+	level   string // CONFIRMED, DANGLING, POTENTIAL
+	detail  string
+}
+
 func (c *Ctx) RunTakeover() error {
 	if c.St.IsDone("takeover") {
 		runner.Info("Takeover: done (resume)")
@@ -1851,15 +1936,69 @@ func (c *Ctx) RunTakeover() error {
 		c.St.MarkDone("takeover")
 		return nil
 	}
-	if runner.HasTool("subzy") {
-		runner.Info("subzy: checking %d subdomains…", runner.CountLines(subs))
-		out := filepath.Join(dir, "takeovers.txt")
-		cmd := c.cmd("subzy", "run", "--targets", subs, "--concurrency", "40", "--timeout", "10")
-		runner.RunToolStdout("subzy", out, c.LogFile, cmd)
-		runner.OK("subzy: %d vulnerable", runner.CountLines(out))
-	} else {
-		runner.Warn("subzy not installed — skipping")
+
+	hosts, _ := runner.ReadLines(subs)
+	takeovers := filepath.Join(dir, "takeovers.txt")
+
+	// ── Native CNAME + fingerprint detection (no external tool needed) ──
+	runner.Info("CNAME + fingerprint analysis on %d host(s)…", len(hosts))
+	results := c.detectTakeovers(hosts)
+
+	// write CNAME map for review
+	var cnameLines []string
+	for _, r := range results {
+		if r.cname != "" {
+			cnameLines = append(cnameLines, fmt.Sprintf("%s → %s", r.host, r.cname))
+		}
 	}
+	sort.Strings(cnameLines)
+	runner.WriteLines(filepath.Join(dir, "cnames.txt"), cnameLines)
+
+	tf, _ := os.Create(takeovers)
+	var confirmed, dangling, potential int
+	for _, r := range results {
+		if r.level == "" {
+			continue
+		}
+		fmt.Fprintf(tf, "[%s] %s → %s (%s) %s\n", r.level, r.host, r.cname, r.service, r.detail)
+		switch r.level {
+		case "CONFIRMED":
+			confirmed++
+		case "DANGLING":
+			dangling++
+		case "POTENTIAL":
+			potential++
+		}
+	}
+	tf.Close()
+
+	if confirmed > 0 {
+		runner.Warn("CONFIRMED takeover(s): %d → %s", confirmed, takeovers)
+	}
+	if dangling > 0 {
+		runner.Warn("Dangling CNAME(s) (NXDOMAIN target): %d → %s", dangling, takeovers)
+	}
+	if potential > 0 {
+		runner.Info("Potential (verify manually): %d", potential)
+	}
+	if confirmed == 0 && dangling == 0 && potential == 0 {
+		runner.OK("No takeover candidates from CNAME analysis")
+	}
+
+	// ── subzy: cross-check with its fingerprint DB (if installed) ──
+	if runner.HasTool("subzy") {
+		runner.Info("subzy: cross-checking %d host(s)…", len(hosts))
+		subzyOut := filepath.Join(dir, "subzy.txt")
+		cmd := c.cmd("subzy", "run", "--targets", subs, "--concurrency", "40", "--timeout", "10", "--hide_fails")
+		runner.RunToolStdout("subzy", subzyOut, c.LogFile, cmd)
+		if n := runner.CountLines(subzyOut); n > 0 {
+			runner.Warn("subzy: %d result(s) → %s", n, subzyOut)
+		}
+	} else {
+		runner.Info("subzy not installed — native detection only")
+	}
+
+	// ── nuclei takeover templates (defense in depth) ──
 	if runner.HasTool("nuclei") {
 		base := c.scanURLList()
 		if runner.NonEmpty(base) {
@@ -1869,12 +2008,122 @@ func (c *Ctx) RunTakeover() error {
 				"-rl", strconv.Itoa(c.Cfg.NucleiRate), "-c", strconv.Itoa(c.Cfg.NucleiConc),
 				"-o", out)
 			runner.RunTool("nuclei", c.LogFile, cmd)
-			runner.OK("nuclei takeover: %d finding(s)", runner.CountLines(out))
+			if n := runner.CountLines(out); n > 0 {
+				runner.Warn("nuclei takeover: %d finding(s)", n)
+			}
 		}
 	}
+
 	c.St.MarkDone("takeover")
 	runner.PruneEmpty(dir)
 	return nil
+}
+
+// detectTakeovers resolves each host's CNAME and probes for dangling-service
+// fingerprints. It runs concurrently and returns one result per host that has
+// either a CNAME of interest or a takeover signal.
+func (c *Ctx) detectTakeovers(hosts []string) []takeoverResult {
+	results := make([]takeoverResult, len(hosts))
+	sem := make(chan struct{}, 20)
+	var wg sync.WaitGroup
+	client := &http.Client{
+		Timeout: 8 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 4 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+
+	for i, h := range hosts {
+		wg.Add(1)
+		go func(idx int, host string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			cname, _ := net.LookupCNAME(host)
+			cname = strings.TrimSuffix(strings.ToLower(cname), ".")
+			// LookupCNAME returns the host itself when there is no CNAME.
+			hasCNAME := cname != "" && cname != strings.ToLower(host)
+
+			res := takeoverResult{host: host}
+			if hasCNAME {
+				res.cname = cname
+			}
+
+			// Match the CNAME target against known services.
+			var fp *takeoverFP
+			if hasCNAME {
+				for i := range takeoverFingerprints {
+					for _, pat := range takeoverFingerprints[i].cname {
+						if strings.Contains(cname, pat) {
+							fp = &takeoverFingerprints[i]
+							break
+						}
+					}
+					if fp != nil {
+						break
+					}
+				}
+			}
+			if fp != nil {
+				res.service = fp.service
+			}
+
+			// Dangling CNAME: the host has a CNAME but nothing resolves to an
+			// address — a classic takeover precondition.
+			if hasCNAME {
+				if addrs, err := net.LookupHost(host); err != nil || len(addrs) == 0 {
+					res.level = "DANGLING"
+					res.detail = "CNAME target does not resolve (NXDOMAIN)"
+					if fp != nil {
+						res.detail += " · service: " + fp.service
+					}
+					results[idx] = res
+					return
+				}
+			}
+
+			// Fingerprint confirmation: fetch the page and look for the
+			// service's unclaimed-page signature.
+			if fp != nil {
+				for _, scheme := range []string{"https", "http"} {
+					req, err := http.NewRequest("GET", scheme+"://"+host+"/", nil)
+					if err != nil {
+						continue
+					}
+					req.Header.Set("User-Agent", c.Cfg.BrowserUA)
+					resp, err := client.Do(req)
+					if err != nil {
+						continue
+					}
+					body, _ := io.ReadAll(io.LimitReader(resp.Body, 200000))
+					resp.Body.Close()
+					if strings.Contains(string(body), fp.body) {
+						if fp.vuln {
+							res.level = "CONFIRMED"
+							res.detail = fmt.Sprintf("fingerprint matched (%d)", resp.StatusCode)
+						} else {
+							res.level = "POTENTIAL"
+							res.detail = fmt.Sprintf("service fingerprint matched, verify claimability (%d)", resp.StatusCode)
+						}
+						results[idx] = res
+						return
+					}
+					// CNAME points at the service but no dangling signature yet.
+					res.level = "POTENTIAL"
+					res.detail = "CNAME points at " + fp.service + ", no dangling signature"
+					results[idx] = res
+					return
+				}
+			}
+			results[idx] = res
+		}(i, h)
+	}
+	wg.Wait()
+	return results
 }
 
 // ── MODULE 11: 403/401 Bypass ─────────────────────────────────
@@ -2038,17 +2287,91 @@ func (c *Ctx) RunXSS() error {
 		runner.MergeFiles(targets, parameterized)
 	}
 
+	// De-noise: collapse URLs that share the same path + parameter *names*
+	// (only the value differs) to one probe each. This is the biggest source
+	// of dalfox noise — archives contain the same endpoint hundreds of times.
+	rawTargets, _ := runner.ReadLines(targets)
+	deduped := dedupeParamURLs(rawTargets)
+	const xssCap = 150
+	capped := false
+	if len(deduped) > xssCap {
+		deduped = deduped[:xssCap]
+		capped = true
+	}
+	runner.WriteLines(targets, deduped)
+	if len(rawTargets) != len(deduped) {
+		runner.Info("Deduped %d → %d unique param signature(s)%s", len(rawTargets), len(deduped),
+			map[bool]string{true: fmt.Sprintf(" (capped at %d)", xssCap), false: ""}[capped])
+	}
+	if len(deduped) == 0 {
+		runner.Info("No XSS candidates after dedup")
+		c.St.MarkDone("xss")
+		runner.PruneEmpty(dir)
+		return nil
+	}
+
+	raw := filepath.Join(dir, "dalfox_raw.txt")
 	out := filepath.Join(dir, "dalfox_results.txt")
-	runner.Info("dalfox: scanning %d URL(s)…", runner.CountLines(targets))
+	runner.Info("dalfox: scanning %d unique URL(s)…", len(deduped))
+	// --skip-bav drops the noisy "basic another vulnerability" probes;
+	// --only-poc=r,v keeps only reflected/verified findings, not grep guesses.
 	cmd := c.cmd("dalfox", "file", targets,
-		"--no-spinner", "--user-agent", c.Cfg.BrowserUA, "--timeout", "10",
-		"-o", out)
+		"--no-spinner", "--no-color", "--skip-bav", "--only-poc", "r,v",
+		"--user-agent", c.Cfg.BrowserUA, "--timeout", "10",
+		"-o", raw)
 	runner.RunTool("dalfox", c.LogFile, cmd)
 	os.Remove(targets)
-	runner.OK("XSS: %d finding(s)", runner.CountLines(out))
+
+	// Keep only real proof-of-concept lines in the headline results file.
+	rawLines, _ := runner.ReadLines(raw)
+	var pocs []string
+	for _, l := range rawLines {
+		if strings.Contains(l, "[POC]") || strings.Contains(l, "[V]") || strings.Contains(l, "[R]") {
+			pocs = append(pocs, l)
+		}
+	}
+	if len(pocs) == 0 {
+		// Fall back to raw output so nothing is silently lost.
+		pocs = rawLines
+	}
+	runner.WriteLines(out, pocs)
+	if n := runner.CountLines(out); n > 0 {
+		runner.Warn("XSS: %d proof-of-concept finding(s) → %s", n, out)
+	} else {
+		runner.OK("XSS: no reflected/verified findings")
+	}
 	c.St.MarkDone("xss")
 	runner.PruneEmpty(dir)
 	return nil
+}
+
+// dedupeParamURLs collapses URLs to one per (scheme, host, path, sorted param
+// names) signature, preserving first-seen order. Value-only variants of the
+// same endpoint collapse to a single representative URL.
+func dedupeParamURLs(urls []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, raw := range urls {
+		u, err := url.Parse(raw)
+		if err != nil {
+			if !seen[raw] {
+				seen[raw] = true
+				out = append(out, raw)
+			}
+			continue
+		}
+		var names []string
+		for k := range u.Query() {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		sig := strings.ToLower(u.Scheme + "://" + u.Host + u.Path + "?" + strings.Join(names, "&"))
+		if !seen[sig] {
+			seen[sig] = true
+			out = append(out, raw)
+		}
+	}
+	return out
 }
 
 // ── MODULE 13: Dorks ─────────────────────────────────────────
@@ -2714,6 +3037,56 @@ func walkJSFiles(dir string) []string {
 		return nil
 	})
 	return files
+}
+
+// sourceMapSrcRe strips scheme-like prefixes (webpack://, ../, etc.) that
+// appear in source-map "sources" entries so they map to a safe local path.
+var sourceMapSrcCleanRe = regexp.MustCompile(`^(?:[a-z]+://|\.{1,2}/|/)+`)
+var sourceMapSegRe = regexp.MustCompile(`[^a-zA-Z0-9._/\-]`)
+
+// reconstructSources writes the original source files carried in a source
+// map's sourcesContent to <root>/<map-host>/<sanitized source path>. It
+// returns the number of files written. Paths are sanitized and constrained
+// under root to avoid path traversal.
+func (c *Ctx) reconstructSources(root, mapURL string, sources, sourcesContent []string) int {
+	if len(sourcesContent) == 0 {
+		return 0
+	}
+	host := "sourcemap"
+	if u, err := url.Parse(mapURL); err == nil && u.Hostname() != "" {
+		host = u.Hostname()
+	}
+	base := filepath.Join(root, host)
+
+	n := 0
+	for i, src := range sources {
+		if i >= len(sourcesContent) {
+			break
+		}
+		content := sourcesContent[i]
+		if content == "" {
+			continue
+		}
+		rel := sourceMapSrcCleanRe.ReplaceAllString(src, "")
+		rel = strings.ReplaceAll(rel, "\\", "/")
+		rel = sourceMapSegRe.ReplaceAllString(rel, "_")
+		rel = strings.TrimLeft(strings.ReplaceAll(rel, "..", "_"), "/")
+		if rel == "" {
+			rel = fmt.Sprintf("source_%d.txt", i)
+		}
+		out := filepath.Join(base, filepath.FromSlash(rel))
+		// Constrain to base after cleaning.
+		if !strings.HasPrefix(filepath.Clean(out), filepath.Clean(base)) {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(out), 0755); err != nil {
+			continue
+		}
+		if os.WriteFile(out, []byte(content), 0644) == nil {
+			n++
+		}
+	}
+	return n
 }
 
 var jsSafeSegRe = regexp.MustCompile(`[^a-zA-Z0-9._\-]`)

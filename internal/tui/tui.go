@@ -21,6 +21,7 @@ import (
 var (
 	colCyan   = lipgloss.Color("#4FC3F7")
 	colYellow = lipgloss.Color("#FFB300")
+	colRed    = lipgloss.Color("#FF5370")
 	colSelBg  = lipgloss.Color("#0D2137")
 	colSelFg  = lipgloss.Color("#4FC3F7")
 	colDoneFg = lipgloss.Color("#4A7C59")
@@ -33,6 +34,7 @@ var (
 	sCyan   = lipgloss.NewStyle().Foreground(colCyan)
 	sCyanB  = lipgloss.NewStyle().Foreground(colCyan).Bold(true)
 	sYellow = lipgloss.NewStyle().Foreground(colYellow).Bold(true)
+	sRed    = lipgloss.NewStyle().Foreground(colRed).Bold(true)
 	sDim    = lipgloss.NewStyle().Faint(true)
 	sBold   = lipgloss.NewStyle().Bold(true)
 
@@ -44,6 +46,9 @@ var (
 	sDone = lipgloss.NewStyle().
 		Foreground(colDoneFg).
 		Faint(true)
+
+	sFail = lipgloss.NewStyle().
+		Foreground(colRed)
 
 	sPending = lipgloss.NewStyle().
 		Faint(true)
@@ -103,6 +108,26 @@ func (m Model) buildModuleResult(key string) string {
 	}
 	n := runner.CountLines(filepath.Join(m.outDir, info[0]))
 	return sCyan.Render("✓") + sDim.Render(fmt.Sprintf("  %s  ·  %d %s  ·  %s", key, n, info[1], elapsed))
+}
+
+// ── Module prerequisites (what should run first) ──────────────
+
+var modPrereq = map[string]string{
+	"http":      "subdomains",
+	"origin":    "subdomains",
+	"ports":     "subdomains",
+	"urls":      "http",
+	"js":        "urls",
+	"fuzz":      "http",
+	"params":    "urls",
+	"nuclei":    "http",
+	"takeover":  "subdomains",
+	"403bypass": "http",
+	"xss":       "params",
+	"cloud":     "subdomains",
+	"headers":   "http",
+	"graphql":   "http",
+	"ssl":       "subdomains",
 }
 
 // ── Module descriptions ───────────────────────────────────────
@@ -179,6 +204,9 @@ type Model struct {
 	st    *state.State
 	stats stats
 
+	failed   map[string]bool // modules whose last run exited non-zero
+	showHelp bool
+
 	lastResult string
 	runStart   time.Time
 }
@@ -203,6 +231,7 @@ func New(a Args) Model {
 		height:    30,
 		st:        st,
 		stats:     loadStats(a.OutDir),
+		failed:    make(map[string]bool),
 	}
 }
 
@@ -220,27 +249,55 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case moduleDoneMsg:
 		m.st.Reload()
 		m.stats = loadStats(m.outDir)
-		m.lastResult = m.buildModuleResult(msg.key)
+		if msg.err != nil {
+			m.failed[msg.key] = true
+			m.lastResult = sRed.Render("✗") + sDim.Render(fmt.Sprintf("  %s failed  ·  see recon.log  ·  %s", msg.key, fmtElapsed(m.runStart)))
+		} else {
+			delete(m.failed, msg.key)
+			m.lastResult = m.buildModuleResult(msg.key)
+		}
 
 	case fullDoneMsg:
 		m.st.Reload()
 		m.stats = loadStats(m.outDir)
-		m.lastResult = sCyan.Render("✓") + sDim.Render("  full scan complete  ·  "+fmtElapsed(m.runStart))
+		if msg.err != nil {
+			m.lastResult = sRed.Render("✗") + sDim.Render("  full scan ended with errors  ·  see recon.log  ·  "+fmtElapsed(m.runStart))
+		} else {
+			m.lastResult = sCyan.Render("✓") + sDim.Render("  full scan complete  ·  "+fmtElapsed(m.runStart))
+		}
 
 	case categoryDoneMsg:
 		m.st.Reload()
 		m.stats = loadStats(m.outDir)
 		catNames := []string{"RECON", "ATTACK", "INTEL"}
 		cat := catNames[msg.catID%3]
-		m.lastResult = sCyan.Render("✓") + sDim.Render("  "+cat+" done  ·  "+fmtElapsed(m.runStart))
+		if msg.err != nil {
+			m.lastResult = sRed.Render("✗") + sDim.Render("  "+cat+" ended with errors  ·  "+fmtElapsed(m.runStart))
+		} else {
+			m.lastResult = sCyan.Render("✓") + sDim.Render("  "+cat+" done  ·  "+fmtElapsed(m.runStart))
+		}
 
 	case reportDoneMsg:
 		m.st.Reload()
 
 	case tea.KeyMsg:
+		// When the help overlay is open, most keys just close it.
+		if m.showHelp {
+			switch msg.String() {
+			case "q", "Q", "ctrl+c":
+				return m, tea.Quit
+			default:
+				m.showHelp = false
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "q", "Q", "ctrl+c":
 			return m, tea.Quit
+
+		case "?":
+			m.showHelp = true
 
 		case "up", "k":
 			if m.selected > 0 {
@@ -282,6 +339,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c", "C":
 			sel := modules.AllModules[m.selected]
 			m.st.MarkUndone(sel.Key)
+			delete(m.failed, sel.Key)
 			m.st.Reload()
 			m.lastResult = sDim.Render("↺  " + sel.Label + "  ·  cleared")
 
@@ -370,11 +428,16 @@ func (m Model) baseArgs() []string {
 // ── View ──────────────────────────────────────────────────────
 
 func (m Model) View() string {
-	var b strings.Builder
 	w := m.width
 	if w < 60 {
 		w = 60
 	}
+
+	if m.showHelp {
+		return m.helpView(w)
+	}
+
+	var b strings.Builder
 
 	hr := func(w int) string { return sHRule.Render(strings.Repeat("─", w)) }
 	thickHr := func(w int) string { return sCyanB.Render(strings.Repeat("─", w)) }
@@ -400,7 +463,7 @@ func (m Model) View() string {
 	// left: brand + target
 	headerL := fmt.Sprintf("  %s  %s  %s  %s  %s",
 		sCyanB.Render("◆ TANYA"),
-		sDim.Render("v6.2"),
+		sDim.Render("v6.3"),
 		sCyan.Render("›"),
 		sCyanB.Render(m.target),
 		sDim.Render("["+mode+"]"),
@@ -522,7 +585,8 @@ func (m Model) View() string {
 		sCyanB.Render("A") + sDim.Render(" ATTACK  ") +
 		sCyanB.Render("I") + sDim.Render(" INTEL  ") +
 		sCyanB.Render("C") + sDim.Render(" clear done  ") +
-		sCyanB.Render("1-9") + sDim.Render(" jump")
+		sCyanB.Render("1-9") + sDim.Render(" jump  ") +
+		sCyanB.Render("?") + sDim.Render(" help")
 	b.WriteString(legend1 + "\n")
 	b.WriteString(legend2 + "\n")
 	b.WriteString(hr(w) + "\n")
@@ -533,18 +597,76 @@ func (m Model) View() string {
 	}
 	sel := modules.AllModules[m.selected]
 	sym := "▶"
-	if m.st.IsDone(sel.Key) {
+	symStyle := sCyanB
+	switch {
+	case m.failed[sel.Key]:
+		sym = "✗"
+		symStyle = sRed
+	case m.st.IsDone(sel.Key):
 		sym = "✓"
 	}
 	desc := modDesc[sel.Key]
 	preview := fmt.Sprintf("  %s  %s  %s  %s",
-		sCyanB.Render(sym),
+		symStyle.Render(sym),
 		sCyanB.Render(sel.Label),
 		sDim.Render("·"),
 		sDim.Render(desc),
 	)
+	// Prerequisite hint: warn if the module this one depends on hasn't run.
+	if pre, ok := modPrereq[sel.Key]; ok && !m.st.IsDone(pre) && !m.st.IsDone(sel.Key) {
+		preview += sYellow.Render("   needs: " + pre)
+	}
 	b.WriteString(preview + "\n")
 
+	return b.String()
+}
+
+// helpView renders the full-screen help/keybinding overlay.
+func (m Model) helpView(w int) string {
+	var b strings.Builder
+	thickHr := func() string { return sCyanB.Render(strings.Repeat("─", w)) }
+	hr := func() string { return sHRule.Render(strings.Repeat("─", w)) }
+
+	b.WriteString(thickHr() + "\n")
+	b.WriteString("  " + sCyanB.Render("◆ TANYA") + "  " + sDim.Render("v6.3") + "  " +
+		sCyan.Render("›") + "  " + sBold.Render("HELP") + "\n")
+	b.WriteString(thickHr() + "\n\n")
+
+	row := func(keys, desc string) {
+		b.WriteString("  " + sCyanB.Render(fmt.Sprintf("%-12s", keys)) + sDim.Render(desc) + "\n")
+	}
+
+	b.WriteString("  " + sCatLabel.Render("◆ NAVIGATION") + "\n")
+	row("↑ ↓ / j k", "move selection")
+	row("g / G", "jump to first / last module")
+	row("tab / ⇧tab", "next / previous category")
+	row("1-9", "jump to module by number")
+	b.WriteString("\n")
+
+	b.WriteString("  " + sCatLabel.Render("◆ RUN") + "\n")
+	row("↵ / space", "run the selected module")
+	row("E / A / I", "run a whole category (RECON / ATTACK / INTEL)")
+	row("F", "run the full pipeline (all modules)")
+	row("R", "generate text + HTML report")
+	row("D", "check installed tool dependencies")
+	row("C", "clear 'done' state for the selected module")
+	b.WriteString("\n")
+
+	b.WriteString("  " + sCatLabel.Render("◆ SYMBOLS") + "\n")
+	b.WriteString("  " + sCyanB.Render("▶") + sDim.Render("  selected     ") +
+		sDone.Render("✓") + sDim.Render("  completed     ") +
+		sRed.Render("✗") + sDim.Render("  failed (see recon.log)     ") +
+		sDim.Render("·  pending") + "\n\n")
+
+	b.WriteString("  " + sCatLabel.Render("◆ NOTES") + "\n")
+	b.WriteString(sDim.Render("    · Modules show \"needs: X\" when a prerequisite hasn't run yet.\n"))
+	b.WriteString(sDim.Render("    · A failed module keeps its ✗ until you re-run or clear (C) it.\n"))
+	b.WriteString(sDim.Render("    · Full tool output is streamed live and saved to recon.log.\n"))
+	b.WriteString(sDim.Render("    · Results are written under output/<host>_<timestamp>/.\n"))
+	b.WriteString("\n")
+
+	b.WriteString(hr() + "\n")
+	b.WriteString("  " + sDim.Render("press any key to return  ·  ") + sCyanB.Render("Q") + sDim.Render(" quit") + "\n")
 	return b.String()
 }
 
@@ -552,12 +674,15 @@ func (m Model) View() string {
 func (m Model) renderCell(i, cw int) string {
 	mod := modules.AllModules[i]
 	isDone := m.st.IsDone(mod.Key)
+	isFail := m.failed[mod.Key]
 	isSel := m.selected == i
 
 	num := fmt.Sprintf("%2d", i+1)
 
 	var sym string
 	switch {
+	case isFail:
+		sym = "✗"
 	case isSel && isDone:
 		sym = "✓"
 	case isSel:
@@ -584,6 +709,8 @@ func (m Model) renderCell(i, cw int) string {
 	switch {
 	case isSel:
 		return sSel.Width(cw).Render(text)
+	case isFail:
+		return sFail.Width(cw).Render(text)
 	case isDone:
 		return sDone.Width(cw).Render(text)
 	default:

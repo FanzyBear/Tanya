@@ -20,7 +20,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fanzybear/tanya/internal/config"
 	"github.com/fanzybear/tanya/internal/runner"
@@ -229,9 +231,14 @@ func (c *Ctx) RunSubdomains() error {
 	return nil
 }
 
+// crtShClient bounds the crt.sh request: the service frequently stalls, and
+// without a timeout a hung connection would block the whole subdomains module
+// (three times over, via Retry).
+var crtShClient = &http.Client{Timeout: 30 * time.Second}
+
 func (c *Ctx) fetchCrtSh(raw string) error {
 	url := fmt.Sprintf("https://crt.sh/?q=%%.%s&output=json", c.Tgt.Domain)
-	resp, err := http.Get(url) //nolint:gosec
+	resp, err := crtShClient.Get(url) //nolint:gosec
 	if err != nil {
 		return err
 	}
@@ -341,7 +348,12 @@ func (c *Ctx) RunHTTP() error {
 		}
 	}
 	f.Close()
-	lf.Close(); af.Close(); intf.Close(); s200f.Close(); s401f.Close(); sRf.Close()
+	lf.Close()
+	af.Close()
+	intf.Close()
+	s200f.Close()
+	s401f.Close()
+	sRf.Close()
 	runner.SortUniqFile(liveURLs)
 
 	n := runner.CountLines(liveURLs)
@@ -376,14 +388,11 @@ func (c *Ctx) classifyChallenges(dir, liveURLs string) {
 
 	urls, _ := runner.ReadLines(liveURLs)
 	type result struct {
-		url     string
-		vendor  string
+		url        string
+		vendor     string
 		challenged bool
 	}
 	results := make([]result, len(urls))
-
-	sem := make(chan struct{}, c.Cfg.ChallengeThreads)
-	var wg sync.WaitGroup
 
 	cfRe := regexp.MustCompile(`(?i)cf-mitigated:\s*challenge|just a moment|challenge-platform|cdn-cgi/challenge|challenges\.cloudflare\.com|__cf_chl|cf_chl_|enable javascript and cookies to continue`)
 	impervaRe := regexp.MustCompile(`(?i)x-iinfo|incap_ses|incapsula|_incapsula_|imperva`)
@@ -403,60 +412,62 @@ func (c *Ctx) classifyChallenges(dir, liveURLs string) {
 		},
 	}
 
-	for i, u := range urls {
-		wg.Add(1)
-		go func(idx int, url string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+	parallelForEach(urls, c.Cfg.ChallengeThreads, func(idx int, url string) {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("User-Agent", c.Cfg.BrowserUA)
+		// Do NOT set Accept-Encoding manually: doing so disables Go's
+		// transparent gzip decompression, leaving resp.Body as compressed
+		// bytes that no signature can match.
 
-			req, err := http.NewRequest("GET", url, nil)
-			if err != nil {
-				return
-			}
-			req.Header.Set("User-Agent", c.Cfg.BrowserUA)
-			req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
 
-			resp, err := client.Do(req)
-			if err != nil {
-				return
+		var hdr strings.Builder
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				fmt.Fprintf(&hdr, "%s: %s\n", k, v)
 			}
-			defer resp.Body.Close()
+		}
+		// Read up to 60KB of the (decompressed) body. A single Read would
+		// return only the first TCP chunk and miss later signatures.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 60000))
+		blob := strings.ToLower(hdr.String() + string(body))
 
-			var hdr strings.Builder
-			for k, vs := range resp.Header {
-				for _, v := range vs {
-					fmt.Fprintf(&hdr, "%s: %s\n", k, v)
-				}
+		r := result{url: url}
+		switch {
+		case cfRe.MatchString(blob):
+			r.vendor = "cloudflare"
+			r.challenged = true
+		case impervaRe.MatchString(blob):
+			r.vendor = "imperva"
+			r.challenged = true
+		case datadomeRe.MatchString(blob):
+			r.vendor = "datadome"
+			r.challenged = true
+		case pxRe.MatchString(blob):
+			r.vendor = "perimeterx"
+			r.challenged = true
+		case awsRe.MatchString(blob):
+			r.vendor = "awswaf"
+			r.challenged = true
+		case akaRe.MatchString(blob) && genericRe.MatchString(blob):
+			r.vendor = "akamai"
+			r.challenged = true
+		default:
+			sc := resp.StatusCode
+			if (sc == 403 || sc == 429 || sc == 503) && genericRe.MatchString(blob) {
+				r.vendor = "generic"
+				r.challenged = true
 			}
-			body := make([]byte, 60000)
-			n, _ := resp.Body.Read(body)
-			blob := strings.ToLower(hdr.String() + string(body[:n]))
-
-			r := result{url: url}
-			switch {
-			case cfRe.MatchString(blob):
-				r.vendor = "cloudflare"; r.challenged = true
-			case impervaRe.MatchString(blob):
-				r.vendor = "imperva"; r.challenged = true
-			case datadomeRe.MatchString(blob):
-				r.vendor = "datadome"; r.challenged = true
-			case pxRe.MatchString(blob):
-				r.vendor = "perimeterx"; r.challenged = true
-			case awsRe.MatchString(blob):
-				r.vendor = "awswaf"; r.challenged = true
-			case akaRe.MatchString(blob) && genericRe.MatchString(blob):
-				r.vendor = "akamai"; r.challenged = true
-			default:
-				sc := resp.StatusCode
-				if (sc == 403 || sc == 429 || sc == 503) && genericRe.MatchString(blob) {
-					r.vendor = "generic"; r.challenged = true
-				}
-			}
-			results[idx] = r
-		}(i, u)
-	}
-	wg.Wait()
+		}
+		results[idx] = r
+	})
 
 	challenged := filepath.Join(dir, "challenged.txt")
 	clean := filepath.Join(dir, "clean_urls.txt")
@@ -474,7 +485,8 @@ func (c *Ctx) classifyChallenges(dir, liveURLs string) {
 			fmt.Fprintln(clf, r.url)
 		}
 	}
-	cf.Close(); clf.Close()
+	cf.Close()
+	clf.Close()
 
 	if chCount > 0 {
 		runner.Warn("%d host(s) behind edge challenge → %s", chCount, challenged)
@@ -613,7 +625,8 @@ func (c *Ctx) RunOrigin() error {
 			break
 		}
 	}
-	cf.Close(); of.Close()
+	cf.Close()
+	of.Close()
 
 	n := runner.CountLines(confirmed)
 	if n > 0 {
@@ -719,6 +732,17 @@ func (c *Ctx) RunURLs() error {
 			"-silent", "-H", "User-Agent: " + c.Cfg.BrowserUA,
 			"-rl", strconv.Itoa(c.Cfg.NucleiRate), "-o", out,
 		}
+		// per-request timeout: bounds a single hung host (katana default is 10s)
+		if c.Cfg.KatanaTimeout > 0 {
+			katanaArgs = append(katanaArgs, "-timeout", strconv.Itoa(c.Cfg.KatanaTimeout))
+		}
+		// optional total crawl-duration cap so crawler traps (session ids,
+		// calendar/pagination params, faceted search) can't spin forever on
+		// parametrized URLs. Off unless KATANA_CRAWL_DURATION is set, so it can
+		// never accidentally truncate a normal crawl to just the seed URL.
+		if c.Cfg.KatanaCrawlDur != "" {
+			katanaArgs = append(katanaArgs, "-ct", c.Cfg.KatanaCrawlDur)
+		}
 		switch c.Tgt.ScopeMode {
 		case target.ScopeStrict:
 			// lock crawler to exact FQDN — never follows links off-host
@@ -728,6 +752,14 @@ func (c *Ctx) RunURLs() error {
 			katanaArgs = append(katanaArgs, "-field-scope", "rdn")
 		}
 		runner.RunTool("katana", c.LogFile, c.cmd("katana", katanaArgs...))
+		// katana emits a URL per link-occurrence, so nav/footer links (home,
+		// product pages) appear thousands of times. Collapse to unique so the
+		// raw file is readable and downstream passes aren't fed 20x duplicates.
+		if runner.NonEmpty(out) {
+			before := runner.CountLines(out)
+			runner.SortUniqFile(out)
+			runner.Info("katana: %d crawled → %d unique URLs", before, runner.CountLines(out))
+		}
 	}
 	if runner.HasTool("waybackurls") {
 		runner.Info("waybackurls…")
@@ -888,13 +920,14 @@ var interestingCommentRe = regexp.MustCompile(`(?i)(todo|fixme|hack|api[_\s]?key
 var singleLineCommentRe = regexp.MustCompile(`//[^\r\n]{4,}`)
 var multiLineCommentRe = regexp.MustCompile(`(?s)/\*.*?\*/`)
 var sourceMapURLRe = regexp.MustCompile(`(?i)//[#@]\s*source(?:Mapping)?URL\s*=\s*(\S+)`)
-var jsParamURLRe   = regexp.MustCompile(`[?&]([a-zA-Z_][a-zA-Z0-9_\-]{0,40})\s*=`)
+var jsParamURLRe = regexp.MustCompile(`[?&]([a-zA-Z_][a-zA-Z0-9_\-]{0,40})\s*=`)
+
 // adminRouteRe captures a full quoted route path that contains an
 // admin/internal keyword segment (group 1), e.g. "/admin/users" or
 // "/internal/debug". Requiring the leading slash + quotes drops the noise
 // the old keyword-only pattern produced (bare "cp", "config", …).
 var adminRouteRe = regexp.MustCompile(`(?i)["'](/[a-z0-9_\-./]*(?:admin|administrator|dashboard|management|internal|superuser|backoffice|sysadmin|moderator|control[-_]panel|/debug|/settings|/config)[a-z0-9_\-./]*)["']`)
-var gqlInJSRe      = regexp.MustCompile(`(?i)(?:useQuery|useMutation|useSubscription|ApolloClient|createHttpLink|InMemoryCache|graphql-tag)\s*\(|/graphql['")\s]`)
+var gqlInJSRe = regexp.MustCompile(`(?i)(?:useQuery|useMutation|useSubscription|ApolloClient|createHttpLink|InMemoryCache|graphql-tag)\s*\(|/graphql['")\s]`)
 
 var techPatterns = map[string]*regexp.Regexp{
 	"React":     regexp.MustCompile(`(?i)from\s+['"]react['"]|ReactDOM\.|React\.createElement`),
@@ -992,36 +1025,26 @@ func (c *Ctx) RunJS() error {
 		}
 	}
 
-	sem := make(chan struct{}, 20)
-	var wg sync.WaitGroup
 	client := &http.Client{Timeout: 15 * time.Second}
-
-	for _, u := range jsURLs {
-		wg.Add(1)
-		go func(rawURL string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			out := jsFileMeta[rawURL]
-			if _, err := os.Stat(out); err == nil {
-				return
-			}
-			os.MkdirAll(filepath.Dir(out), 0755)
-			req, err := http.NewRequest("GET", rawURL, nil)
-			if err != nil {
-				return
-			}
-			req.Header.Set("User-Agent", c.Cfg.CurlUA)
-			resp, err := client.Do(req)
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-			os.WriteFile(out, body, 0644)
-		}(u)
-	}
-	wg.Wait()
+	parallelForEach(jsURLs, 20, func(_ int, rawURL string) {
+		out := jsFileMeta[rawURL]
+		if _, err := os.Stat(out); err == nil {
+			return
+		}
+		os.MkdirAll(filepath.Dir(out), 0755)
+		req, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("User-Agent", c.Cfg.CurlUA)
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		os.WriteFile(out, body, 0644)
+	})
 
 	// Build abs-path → URL index (for source map resolution)
 	urlByAbsPath := make(map[string]string, len(jsURLs))
@@ -1100,13 +1123,27 @@ func (c *Ctx) RunJS() error {
 	// comment, or a <file>.js.map sibling fallback) and, when the map is
 	// readable, recover the original pre-minified sources from sourcesContent
 	// to js/recovered/ — the highest-value artefact a source map leaks.
-	runner.Info("Source map detection + reconstruction…")
+	runner.Info("Source map detection + reconstruction… (%d JS files)", len(jsFilePaths))
 	recoveredDir := filepath.Join(dir, "recovered")
 	var smapLines []string
-	smapSeen := make(map[string]bool)
 	totalRecovered := 0
-	smclient := &http.Client{Timeout: 12 * time.Second}
-	for _, fpath := range jsFilePaths {
+	smclient := &http.Client{Timeout: 8 * time.Second}
+
+	// Each JS file is probed independently, so run them through a worker pool
+	// instead of serially — with tens of thousands of files, one-at-a-time
+	// network probes (each up to the client timeout) can hang the module for
+	// hours. Per-file results are written to results[i] with no shared-slice
+	// races; smapSeen dedups map URLs across goroutines under a mutex.
+	type smapResult struct {
+		lines     []string
+		recovered int
+	}
+	results := make([]smapResult, len(jsFilePaths))
+	smapSeen := make(map[string]bool)
+	var seenMu sync.Mutex
+	var progress int64
+
+	parallelForEach(jsFilePaths, 30, func(i int, fpath string) {
 		content, _ := os.ReadFile(fpath)
 		origURL := urlByAbsPath[fpath]
 
@@ -1134,10 +1171,13 @@ func (c *Ctx) RunJS() error {
 		}
 
 		for _, mapURL := range mapCandidates {
+			seenMu.Lock()
 			if smapSeen[mapURL] {
+				seenMu.Unlock()
 				continue
 			}
 			smapSeen[mapURL] = true
+			seenMu.Unlock()
 
 			req, err := http.NewRequest("GET", mapURL, nil)
 			if err != nil {
@@ -1162,17 +1202,26 @@ func (c *Ctx) RunJS() error {
 			}
 
 			nRec := c.reconstructSources(recoveredDir, mapURL, sm.Sources, sm.SourcesContent)
-			totalRecovered += nRec
+			results[i].recovered += nRec
 			if nRec > 0 {
-				smapLines = append(smapLines, fmt.Sprintf("[EXPOSED %d sources · %d recovered] %s", len(sm.Sources), nRec, mapURL))
+				results[i].lines = append(results[i].lines, fmt.Sprintf("[EXPOSED %d sources · %d recovered] %s", len(sm.Sources), nRec, mapURL))
 			} else {
-				smapLines = append(smapLines, fmt.Sprintf("[EXPOSED %d sources · no sourcesContent] %s", len(sm.Sources), mapURL))
+				results[i].lines = append(results[i].lines, fmt.Sprintf("[EXPOSED %d sources · no sourcesContent] %s", len(sm.Sources), mapURL))
 			}
 			for _, src := range sm.Sources {
-				smapLines = append(smapLines, "  src: "+src)
+				results[i].lines = append(results[i].lines, "  src: "+src)
 			}
 			break // one map per JS file is enough
 		}
+
+		if n := atomic.AddInt64(&progress, 1); n%2000 == 0 {
+			runner.Info("  source maps: %d/%d JS files checked…", n, len(jsFilePaths))
+		}
+	})
+
+	for _, r := range results {
+		smapLines = append(smapLines, r.lines...)
+		totalRecovered += r.recovered
 	}
 	runner.WriteLines(filepath.Join(dir, "sourcemaps.txt"), smapLines)
 	if len(smapLines) > 0 {
@@ -1401,46 +1450,37 @@ func (c *Ctx) RunJS() error {
 			pageURLs = pageURLs[:100]
 		}
 		hclient := &http.Client{Timeout: 10 * time.Second}
-		hsem := make(chan struct{}, 10)
-		var hwg sync.WaitGroup
 		var hmu sync.Mutex
-		for _, u := range pageURLs {
-			hwg.Add(1)
-			go func(pageURL string) {
-				defer hwg.Done()
-				hsem <- struct{}{}
-				defer func() { <-hsem }()
-				req, err := http.NewRequest("GET", pageURL, nil)
-				if err != nil {
-					return
+		parallelForEach(pageURLs, 10, func(_ int, pageURL string) {
+			req, err := http.NewRequest("GET", pageURL, nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("User-Agent", c.Cfg.BrowserUA)
+			resp, err := hclient.Do(req)
+			if err != nil {
+				return
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			ct := resp.Header.Get("Content-Type")
+			if ct != "" && !strings.Contains(ct, "html") && !strings.Contains(ct, "text") {
+				return
+			}
+			for _, m := range htmlCommentBodyRe.FindAllStringSubmatch(string(body), -1) {
+				inner := strings.TrimSpace(m[1])
+				if inner == "" || strings.HasPrefix(inner, "[if ") {
+					continue
 				}
-				req.Header.Set("User-Agent", c.Cfg.BrowserUA)
-				resp, err := hclient.Do(req)
-				if err != nil {
-					return
+				entry := fmt.Sprintf("[%s] <!-- %s -->", pageURL, truncate(strings.Join(strings.Fields(inner), " "), 200))
+				hmu.Lock()
+				if !htmlCommentSeen[entry] {
+					htmlCommentSeen[entry] = true
+					htmlComments = append(htmlComments, entry)
 				}
-				body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-				resp.Body.Close()
-				ct := resp.Header.Get("Content-Type")
-				if ct != "" && !strings.Contains(ct, "html") && !strings.Contains(ct, "text") {
-					return
-				}
-				for _, m := range htmlCommentBodyRe.FindAllStringSubmatch(string(body), -1) {
-					inner := strings.TrimSpace(m[1])
-					if inner == "" || strings.HasPrefix(inner, "[if ") {
-						continue
-					}
-					entry := fmt.Sprintf("[%s] <!-- %s -->", pageURL, truncate(strings.Join(strings.Fields(inner), " "), 200))
-					hmu.Lock()
-					if !htmlCommentSeen[entry] {
-						htmlCommentSeen[entry] = true
-						htmlComments = append(htmlComments, entry)
-					}
-					hmu.Unlock()
-				}
-			}(u)
-		}
-		hwg.Wait()
+				hmu.Unlock()
+			}
+		})
 	}
 	sort.Strings(htmlComments)
 	runner.WriteLines(filepath.Join(dir, "html_comments.txt"), htmlComments)
@@ -1510,60 +1550,50 @@ func buildPageJSMap(c *Ctx, liveURLsFile string) []pageJSEntry {
 	}
 	var mu sync.Mutex
 	var results []pageJSEntry
-	sem := make(chan struct{}, 10)
-	var wg sync.WaitGroup
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	for _, pageURL := range lines {
-		wg.Add(1)
-		go func(u string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			req, err := http.NewRequest("GET", u, nil)
+	parallelForEach(lines, 10, func(_ int, u string) {
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("User-Agent", c.Cfg.CurlUA)
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "html") {
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		matches := scriptSrcRe.FindAllSubmatch(body, -1)
+		if len(matches) == 0 {
+			return
+		}
+		base, err := url.Parse(u)
+		if err != nil {
+			return
+		}
+		seen := make(map[string]bool)
+		var scripts []string
+		for _, m := range matches {
+			ref, err := url.Parse(string(m[1]))
 			if err != nil {
-				return
+				continue
 			}
-			req.Header.Set("User-Agent", c.Cfg.CurlUA)
-			resp, err := client.Do(req)
-			if err != nil {
-				return
+			abs := base.ResolveReference(ref).String()
+			if !seen[abs] {
+				seen[abs] = true
+				scripts = append(scripts, abs)
 			}
-			defer resp.Body.Close()
-			if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "html") {
-				return
-			}
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			matches := scriptSrcRe.FindAllSubmatch(body, -1)
-			if len(matches) == 0 {
-				return
-			}
-			base, err := url.Parse(u)
-			if err != nil {
-				return
-			}
-			seen := make(map[string]bool)
-			var scripts []string
-			for _, m := range matches {
-				ref, err := url.Parse(string(m[1]))
-				if err != nil {
-					continue
-				}
-				abs := base.ResolveReference(ref).String()
-				if !seen[abs] {
-					seen[abs] = true
-					scripts = append(scripts, abs)
-				}
-			}
-			if len(scripts) > 0 {
-				mu.Lock()
-				results = append(results, pageJSEntry{Page: u, Scripts: scripts})
-				mu.Unlock()
-			}
-		}(pageURL)
-	}
-	wg.Wait()
+		}
+		if len(scripts) > 0 {
+			mu.Lock()
+			results = append(results, pageJSEntry{Page: u, Scripts: scripts})
+			mu.Unlock()
+		}
+	})
 	sort.Slice(results, func(i, j int) bool { return results[i].Page < results[j].Page })
 	return results
 }
@@ -1710,7 +1740,16 @@ func (c *Ctx) RunParams() error {
 		runner.OK("Parameterized URLs: %d", len(parameterized))
 
 		ssrfFile := filepath.Join(dir, "ssrf_params.txt")
-		if runner.HasTool("nuclei") && runner.NonEmpty(ssrfFile) {
+		switch {
+		case !c.Cfg.SSRFProbe:
+			// OAST-based SSRF probing over every parameterized URL is very slow;
+			// off unless SSRF_PROBE=true. Candidates are still written to
+			// ssrf_params.txt for manual/targeted testing.
+			if runner.NonEmpty(ssrfFile) {
+				runner.Info("nuclei SSRF probe skipped (SSRF_PROBE not enabled); %d candidate(s) in %s",
+					runner.CountLines(ssrfFile), ssrfFile)
+			}
+		case runner.HasTool("nuclei") && runner.NonEmpty(ssrfFile):
 			runner.Info("nuclei SSRF probe on %d candidate(s)…", runner.CountLines(ssrfFile))
 			out := filepath.Join(dir, "nuclei_ssrf.txt")
 			cmd := c.cmd("nuclei", "-l", ssrfFile,
@@ -2024,8 +2063,6 @@ func (c *Ctx) RunTakeover() error {
 // either a CNAME of interest or a takeover signal.
 func (c *Ctx) detectTakeovers(hosts []string) []takeoverResult {
 	results := make([]takeoverResult, len(hosts))
-	sem := make(chan struct{}, 20)
-	var wg sync.WaitGroup
 	client := &http.Client{
 		Timeout: 8 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -2036,93 +2073,85 @@ func (c *Ctx) detectTakeovers(hosts []string) []takeoverResult {
 		},
 	}
 
-	for i, h := range hosts {
-		wg.Add(1)
-		go func(idx int, host string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+	parallelForEach(hosts, 20, func(idx int, host string) {
+		cname, _ := net.LookupCNAME(host)
+		cname = strings.TrimSuffix(strings.ToLower(cname), ".")
+		// LookupCNAME returns the host itself when there is no CNAME.
+		hasCNAME := cname != "" && cname != strings.ToLower(host)
 
-			cname, _ := net.LookupCNAME(host)
-			cname = strings.TrimSuffix(strings.ToLower(cname), ".")
-			// LookupCNAME returns the host itself when there is no CNAME.
-			hasCNAME := cname != "" && cname != strings.ToLower(host)
+		res := takeoverResult{host: host}
+		if hasCNAME {
+			res.cname = cname
+		}
 
-			res := takeoverResult{host: host}
-			if hasCNAME {
-				res.cname = cname
-			}
-
-			// Match the CNAME target against known services.
-			var fp *takeoverFP
-			if hasCNAME {
-				for i := range takeoverFingerprints {
-					for _, pat := range takeoverFingerprints[i].cname {
-						if strings.Contains(cname, pat) {
-							fp = &takeoverFingerprints[i]
-							break
-						}
-					}
-					if fp != nil {
+		// Match the CNAME target against known services.
+		var fp *takeoverFP
+		if hasCNAME {
+			for i := range takeoverFingerprints {
+				for _, pat := range takeoverFingerprints[i].cname {
+					if strings.Contains(cname, pat) {
+						fp = &takeoverFingerprints[i]
 						break
 					}
 				}
+				if fp != nil {
+					break
+				}
 			}
-			if fp != nil {
-				res.service = fp.service
-			}
+		}
+		if fp != nil {
+			res.service = fp.service
+		}
 
-			// Dangling CNAME: the host has a CNAME but nothing resolves to an
-			// address — a classic takeover precondition.
-			if hasCNAME {
-				if addrs, err := net.LookupHost(host); err != nil || len(addrs) == 0 {
-					res.level = "DANGLING"
-					res.detail = "CNAME target does not resolve (NXDOMAIN)"
-					if fp != nil {
-						res.detail += " · service: " + fp.service
+		// Dangling CNAME: the host has a CNAME but nothing resolves to an
+		// address — a classic takeover precondition.
+		if hasCNAME {
+			if addrs, err := net.LookupHost(host); err != nil || len(addrs) == 0 {
+				res.level = "DANGLING"
+				res.detail = "CNAME target does not resolve (NXDOMAIN)"
+				if fp != nil {
+					res.detail += " · service: " + fp.service
+				}
+				results[idx] = res
+				return
+			}
+		}
+
+		// Fingerprint confirmation: fetch the page and look for the
+		// service's unclaimed-page signature.
+		if fp != nil {
+			for _, scheme := range []string{"https", "http"} {
+				req, err := http.NewRequest("GET", scheme+"://"+host+"/", nil)
+				if err != nil {
+					continue
+				}
+				req.Header.Set("User-Agent", c.Cfg.BrowserUA)
+				resp, err := client.Do(req)
+				if err != nil {
+					continue
+				}
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 200000))
+				resp.Body.Close()
+				if strings.Contains(string(body), fp.body) {
+					if fp.vuln {
+						res.level = "CONFIRMED"
+						res.detail = fmt.Sprintf("fingerprint matched (%d)", resp.StatusCode)
+					} else {
+						res.level = "POTENTIAL"
+						res.detail = fmt.Sprintf("service fingerprint matched, verify claimability (%d)", resp.StatusCode)
 					}
 					results[idx] = res
 					return
 				}
+				// CNAME points at the service but no dangling signature yet.
+				res.level = "POTENTIAL"
+				res.detail = "CNAME points at " + fp.service + ", no dangling signature"
+				results[idx] = res
+				return
 			}
-
-			// Fingerprint confirmation: fetch the page and look for the
-			// service's unclaimed-page signature.
-			if fp != nil {
-				for _, scheme := range []string{"https", "http"} {
-					req, err := http.NewRequest("GET", scheme+"://"+host+"/", nil)
-					if err != nil {
-						continue
-					}
-					req.Header.Set("User-Agent", c.Cfg.BrowserUA)
-					resp, err := client.Do(req)
-					if err != nil {
-						continue
-					}
-					body, _ := io.ReadAll(io.LimitReader(resp.Body, 200000))
-					resp.Body.Close()
-					if strings.Contains(string(body), fp.body) {
-						if fp.vuln {
-							res.level = "CONFIRMED"
-							res.detail = fmt.Sprintf("fingerprint matched (%d)", resp.StatusCode)
-						} else {
-							res.level = "POTENTIAL"
-							res.detail = fmt.Sprintf("service fingerprint matched, verify claimability (%d)", resp.StatusCode)
-						}
-						results[idx] = res
-						return
-					}
-					// CNAME points at the service but no dangling signature yet.
-					res.level = "POTENTIAL"
-					res.detail = "CNAME points at " + fp.service + ", no dangling signature"
-					results[idx] = res
-					return
-				}
-			}
-			results[idx] = res
-		}(i, h)
-	}
-	wg.Wait()
+		}
+		results[idx] = res
+	})
 	return results
 }
 
@@ -2181,57 +2210,51 @@ func (c *Ctx) Run403Bypass() error {
 	pathSufs := []string{"/%2e", "/.", "//"}
 	successRe := regexp.MustCompile(`^2\d\d$`)
 
-	type bypassHit struct{ url, method string; code int }
+	type bypassHit struct {
+		url, method string
+		code        int
+	}
 	hits := make(chan bypassHit, len(targets)*3)
 
-	sem := make(chan struct{}, 15)
-	var wg sync.WaitGroup
-	for _, u := range targets {
-		wg.Add(1)
-		go func(target string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			cl := &http.Client{Timeout: 8 * time.Second}
-			for _, hdr := range bypassHeaders {
-				req, err := http.NewRequest("GET", target, nil)
-				if err != nil {
-					continue
-				}
-				req.Header.Set("User-Agent", c.Cfg.BrowserUA)
-				parts := strings.SplitN(hdr, ": ", 2)
-				if len(parts) == 2 {
-					req.Header.Set(parts[0], parts[1])
-				}
-				resp, err := cl.Do(req)
-				if err == nil {
-					code := resp.StatusCode
-					resp.Body.Close()
-					if successRe.MatchString(strconv.Itoa(code)) {
-						hits <- bypassHit{target, "HEADER: " + hdr, code}
-						return
-					}
+	parallelForEach(targets, 15, func(_ int, target string) {
+		cl := &http.Client{Timeout: 8 * time.Second}
+		for _, hdr := range bypassHeaders {
+			req, err := http.NewRequest("GET", target, nil)
+			if err != nil {
+				continue
+			}
+			req.Header.Set("User-Agent", c.Cfg.BrowserUA)
+			parts := strings.SplitN(hdr, ": ", 2)
+			if len(parts) == 2 {
+				req.Header.Set(parts[0], parts[1])
+			}
+			resp, err := cl.Do(req)
+			if err == nil {
+				code := resp.StatusCode
+				resp.Body.Close()
+				if successRe.MatchString(strconv.Itoa(code)) {
+					hits <- bypassHit{target, "HEADER: " + hdr, code}
+					return
 				}
 			}
-			for _, suf := range pathSufs {
-				req, err := http.NewRequest("GET", target+suf, nil)
-				if err != nil {
-					continue
-				}
-				req.Header.Set("User-Agent", c.Cfg.BrowserUA)
-				resp, err := cl.Do(req)
-				if err == nil {
-					code := resp.StatusCode
-					resp.Body.Close()
-					if successRe.MatchString(strconv.Itoa(code)) {
-						hits <- bypassHit{target, "PATH: " + suf, code}
-						return
-					}
+		}
+		for _, suf := range pathSufs {
+			req, err := http.NewRequest("GET", target+suf, nil)
+			if err != nil {
+				continue
+			}
+			req.Header.Set("User-Agent", c.Cfg.BrowserUA)
+			resp, err := cl.Do(req)
+			if err == nil {
+				code := resp.StatusCode
+				resp.Body.Close()
+				if successRe.MatchString(strconv.Itoa(code)) {
+					hits <- bypassHit{target, "PATH: " + suf, code}
+					return
 				}
 			}
-		}(u)
-	}
-	wg.Wait()
+		}
+	})
 	close(hits)
 
 	bypassed := filepath.Join(dir, "bypassed.txt")
@@ -2701,7 +2724,8 @@ func (c *Ctx) RunGraphQL() error {
 				}
 			}
 		}
-		intf.Close(); batf.Close()
+		intf.Close()
+		batf.Close()
 		runner.OK("introspection enabled: %d · batch allowed: %d",
 			runner.CountLines(introOut), runner.CountLines(batchOut))
 
@@ -3027,6 +3051,28 @@ func (c *Ctx) RunCategory(catID int) {
 
 // ── Helpers ───────────────────────────────────────────────────
 
+// parallelForEach runs fn over items with at most `workers` goroutines active
+// at once. fn receives the item's index and the item; because each index is
+// owned by exactly one goroutine, fn may write results[i] without a lock.
+// It replaces the sem-channel + WaitGroup boilerplate repeated across modules.
+func parallelForEach[T any](items []T, workers int, fn func(i int, item T)) {
+	if workers < 1 {
+		workers = 1
+	}
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for i, item := range items {
+		wg.Add(1)
+		go func(i int, item T) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fn(i, item)
+		}(i, item)
+	}
+	wg.Wait()
+}
+
 // walkJSFiles returns all .js file paths under dir (recursive).
 func walkJSFiles(dir string) []string {
 	var files []string
@@ -3334,22 +3380,27 @@ func simpleHash(s string) uint64 {
 	return h
 }
 
+var safeNameRe = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
+
 func safeName(u string) string {
-	re := regexp.MustCompile(`[^a-zA-Z0-9._-]`)
-	s := re.ReplaceAllString(u, "_")
+	s := safeNameRe.ReplaceAllString(u, "_")
 	if len(s) > 80 {
 		s = s[:80]
 	}
 	return s
 }
 
+// truncate caps s at n bytes without splitting a multibyte UTF-8 rune.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
+	// Back off to the last rune boundary at or before n.
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
 	return s[:n]
 }
-
 
 func runWithTimeout(cmd *exec.Cmd, timeout time.Duration) error {
 	done := make(chan error, 1)
@@ -3422,100 +3473,6 @@ func parseGitleaksOutput(path string, out *[]string, seen map[string]bool) {
 			*out = append(*out, line)
 		}
 	}
-}
-
-// ── URL crawl-map helpers ─────────────────────────────────────
-
-type urlNode struct {
-	kids  map[string]*urlNode
-	total int // URLs at or below this node
-}
-
-func newURLNode() *urlNode { return &urlNode{kids: make(map[string]*urlNode)} }
-
-func insertURLPath(root *urlNode, path string) {
-	root.total++
-	segs := strings.Split(strings.Trim(path, "/"), "/")
-	cur := root
-	for _, s := range segs {
-		if s == "" {
-			continue
-		}
-		if cur.kids[s] == nil {
-			cur.kids[s] = newURLNode()
-		}
-		cur = cur.kids[s]
-		cur.total++
-	}
-}
-
-func renderURLNode(sb *strings.Builder, n *urlNode, prefix string, rem *int, depth int) {
-	if *rem <= 0 || depth > 5 {
-		return
-	}
-	keys := make([]string, 0, len(n.kids))
-	for k := range n.kids {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for i, k := range keys {
-		if *rem <= 0 {
-			sb.WriteString(prefix + "└── …\n")
-			return
-		}
-		*rem--
-		child := n.kids[k]
-		last := i == len(keys)-1
-		branch, cont := "├── ", "│   "
-		if last {
-			branch, cont = "└── ", "    "
-		}
-		label := k
-		if len(child.kids) > 0 {
-			label += "/"
-		}
-		if child.total > 1 {
-			label += fmt.Sprintf("  (%d)", child.total)
-		}
-		sb.WriteString(prefix + branch + label + "\n")
-		renderURLNode(sb, child, prefix+cont, rem, depth+1)
-	}
-}
-
-func buildURLCrawlMap(urlsFile string) string {
-	lines, _ := runner.ReadLines(urlsFile)
-	if len(lines) == 0 {
-		return ""
-	}
-	byHost := map[string]*urlNode{}
-	var hostOrder []string
-	for _, raw := range lines {
-		u, err := url.Parse(raw)
-		if err != nil || u.Hostname() == "" {
-			continue
-		}
-		h := strings.ToLower(u.Hostname())
-		if byHost[h] == nil {
-			byHost[h] = newURLNode()
-			hostOrder = append(hostOrder, h)
-		}
-		insertURLPath(byHost[h], u.Path)
-	}
-	sort.Strings(hostOrder)
-	var sb strings.Builder
-	for i, host := range hostOrder {
-		root := byHost[host]
-		sb.WriteString(fmt.Sprintf("  %s  (%d URLs)\n", host, root.total))
-		rem := 120
-		renderURLNode(&sb, root, "  ", &rem, 0)
-		if rem <= 0 {
-			sb.WriteString("  … (truncated — see urls/urls.txt for full list)\n")
-		}
-		if i < len(hostOrder)-1 {
-			sb.WriteString("\n")
-		}
-	}
-	return sb.String()
 }
 
 // ── file-tree helpers ─────────────────────────────────────────

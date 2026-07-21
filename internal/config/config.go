@@ -12,6 +12,8 @@ type Config struct {
 	NaabuThreads     int
 	NaabuRate        int
 	KatanaDepth      int
+	KatanaCrawlDur   string
+	KatanaTimeout    int
 	FfufThreads      int
 	FfufWordlist     string
 	CurlUA           string
@@ -21,6 +23,7 @@ type Config struct {
 	NucleiRetries    int
 	NucleiTimeout    int
 	ChallengeThreads int
+	SSRFProbe         bool
 	SecurityTrailsKey string
 	ShodanKey         string
 }
@@ -31,6 +34,8 @@ func Defaults() *Config {
 		NaabuThreads:     100,
 		NaabuRate:        1000,
 		KatanaDepth:      3,
+		KatanaCrawlDur:   "", // off by default; set KATANA_CRAWL_DURATION to cap runaway crawls
+		KatanaTimeout:    10,
 		FfufThreads:      40,
 		FfufWordlist:     os.ExpandEnv("$HOME/SecLists/Discovery/Web-Content/common.txt"),
 		CurlUA:           "Mozilla/5.0 (recon; +tanya)",
@@ -73,6 +78,12 @@ func Load(path string) (*Config, error) {
 			setInt(v, &cfg.NaabuRate)
 		case "KATANA_DEPTH":
 			setInt(v, &cfg.KatanaDepth)
+		case "KATANA_CRAWL_DURATION":
+			if v != "" {
+				cfg.KatanaCrawlDur = v
+			}
+		case "KATANA_TIMEOUT":
+			setInt(v, &cfg.KatanaTimeout)
 		case "FFUF_THREADS":
 			setInt(v, &cfg.FfufThreads)
 		case "FFUF_WORDLIST":
@@ -85,6 +96,8 @@ func Load(path string) (*Config, error) {
 			setInt(v, &cfg.NucleiConc)
 		case "CHALLENGE_THREADS":
 			setInt(v, &cfg.ChallengeThreads)
+		case "SSRF_PROBE":
+			cfg.SSRFProbe = isTrue(v)
 		case "SECURITYTRAILS_API_KEY":
 			cfg.SecurityTrailsKey = v
 		case "SHODAN_API_KEY":
@@ -92,6 +105,14 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	return cfg, sc.Err()
+}
+
+func isTrue(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func setInt(s string, dst *int) {

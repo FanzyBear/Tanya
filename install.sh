@@ -322,11 +322,20 @@ NAABU_THREADS=200
 NAABU_RATE=2000
 FFUF_THREADS=100
 KATANA_DEPTH=5
+KATANA_TIMEOUT=10
+# Optional hard cap on total crawl time. Leave unset for unlimited.
+# Set this (e.g. 10m) if the crawler gets stuck in traps — session ids,
+# calendar/pagination params — that generate endless "unique" URLs.
+# Lowering KATANA_DEPTH is usually the more effective fix.
+# KATANA_CRAWL_DURATION=10m
 
 # ── Nuclei tuning ────────────────────────────────────────────────
 # NUCLEI_RATE=150
 # NUCLEI_CONC=25
 # CHALLENGE_THREADS=15
+# OAST-based SSRF probe over every parameterized URL — slow on large
+# targets. Off by default; candidates are still saved to ssrf_params.txt.
+# SSRF_PROBE=true
 
 # ── Wordlists ────────────────────────────────────────────────────
 FFUF_WORDLIST="$HOME/SecLists/Discovery/Web-Content/common.txt"

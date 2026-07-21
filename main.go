@@ -435,6 +435,8 @@ func printHelp() {
 	fmt.Printf("  %-28s %s\n", "HTTPX_THREADS=50",              "httpx concurrency")
 	fmt.Printf("  %-28s %s\n", "NAABU_RATE=1000",               "naabu packets/sec")
 	fmt.Printf("  %-28s %s\n", "KATANA_DEPTH=3",                "crawler depth")
+	fmt.Printf("  %-28s %s\n", "KATANA_TIMEOUT=10",            "crawler per-request timeout (s)")
+	fmt.Printf("  %-28s %s\n", "KATANA_CRAWL_DURATION=",       "crawler total time cap, e.g. 10m (unset=unlimited)")
 	fmt.Printf("  %-28s %s\n", "FFUF_THREADS=40",               "ffuf concurrency")
 	fmt.Printf("  %-28s %s\n", "FFUF_WORDLIST=~/SecLists/...",  "wordlist path")
 	fmt.Printf("  %-28s %s\n", "NUCLEI_RATE=150",               "nuclei requests/sec")

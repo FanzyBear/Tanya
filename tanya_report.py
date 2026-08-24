@@ -803,7 +803,8 @@ section {
   border: 1px solid var(--border); border-radius: var(--r10);
   background: var(--bg1); overflow: hidden;
 }
-.sec-head.closed + .sec-body { display: none; }
+.sec-head.closed ~ .sec-body { display: none; }
+.sec-head.closed ~ .sev-pills { display: none; }
 .empty-state {
   padding: 20px 18px; color: var(--ink3); font-size: 12px;
   display: flex; align-items: center; gap: 8px;

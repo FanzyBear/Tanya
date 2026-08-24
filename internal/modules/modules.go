@@ -138,6 +138,32 @@ func (c *Ctx) cmd(name string, args ...string) *exec.Cmd {
 	return exec.Command(name, args...)
 }
 
+// nucleiTemplatesDir resolves nuclei's default template directory
+// ($HOME/nuclei-templates). Auto-detection has been observed to fail with
+// "no templates provided for scan" even right after -update-templates
+// succeeds, so scans pass this path explicitly via -t instead of relying on
+// nuclei to find it on its own.
+func nucleiTemplatesDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(home, "nuclei-templates")
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		return dir
+	}
+	return ""
+}
+
+// nucleiCmd builds a nuclei invocation with an explicit -t template path
+// (see nucleiTemplatesDir) so scans don't silently run with zero templates.
+func (c *Ctx) nucleiCmd(args ...string) *exec.Cmd {
+	if dir := nucleiTemplatesDir(); dir != "" {
+		args = append([]string{"-t", dir}, args...)
+	}
+	return c.cmd("nuclei", args...)
+}
+
 func (c *Ctx) scanURLList() string {
 	clean := filepath.Join(c.OutDir, "http", "clean_urls.txt")
 	live := filepath.Join(c.OutDir, "http", "live_urls.txt")
@@ -195,9 +221,9 @@ func (c *Ctx) RunSubdomains() error {
 			runner.RunTool("chaos", c.LogFile, cmd)
 			runner.MergeFiles(raw, out)
 		}
-		runner.Info("crt.sh…")
-		if err := runner.Retry(3, func() error { return c.fetchCrtSh(raw) }); err != nil {
-			runner.Warn("crt.sh failed")
+		runner.Info("crt.name…")
+		if err := runner.Retry(3, func() error { return c.fetchCrtName(raw) }); err != nil {
+			runner.Warn("crt.name failed")
 		}
 	}
 
@@ -231,32 +257,31 @@ func (c *Ctx) RunSubdomains() error {
 	return nil
 }
 
-// crtShClient bounds the crt.sh request: the service frequently stalls, and
-// without a timeout a hung connection would block the whole subdomains module
-// (three times over, via Retry).
-var crtShClient = &http.Client{Timeout: 30 * time.Second}
+// crtNameClient bounds the crt.name request: certificate-transparency lookups
+// frequently stall, and without a timeout a hung connection would block the
+// whole subdomains module (three times over, via Retry).
+var crtNameClient = &http.Client{Timeout: 30 * time.Second}
 
-func (c *Ctx) fetchCrtSh(raw string) error {
-	url := fmt.Sprintf("https://crt.sh/?q=%%.%s&output=json", c.Tgt.Domain)
-	resp, err := crtShClient.Get(url) //nolint:gosec
+func (c *Ctx) fetchCrtName(raw string) error {
+	url := fmt.Sprintf("https://crt.name/v1/search?apex=%s", c.Tgt.Domain)
+	resp, err := crtNameClient.Get(url) //nolint:gosec
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	var records []struct {
-		NameValue string `json:"name_value"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&records); err != nil {
-		return err
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("crt.name: unexpected status %d", resp.StatusCode)
 	}
 	var names []string
-	for _, r := range records {
-		for _, n := range strings.Split(r.NameValue, "\n") {
-			n = strings.TrimPrefix(strings.TrimSpace(n), "*.")
-			if n != "" {
-				names = append(names, n)
-			}
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		n := strings.TrimPrefix(strings.TrimSpace(scanner.Text()), "*.")
+		if n != "" {
+			names = append(names, n)
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
 	}
 	return runner.AppendLines(raw, names)
 }
@@ -366,7 +391,7 @@ func (c *Ctx) RunHTTP() error {
 	if runner.HasTool("nuclei") && runner.NonEmpty(liveURLs) {
 		runner.Info("WAF detection…")
 		waf := filepath.Join(dir, "waf.txt")
-		cmd := c.cmd("nuclei", "-l", liveURLs, "-tags", "waf", "-silent", "-o", waf)
+		cmd := c.nucleiCmd("-l", liveURLs, "-tags", "waf", "-silent", "-o", waf)
 		runner.RunTool("nuclei", c.LogFile, cmd)
 		if runner.CountLines(waf) > 0 {
 			runner.Warn("%d WAF fingerprint(s) → %s", runner.CountLines(waf), waf)
@@ -1752,7 +1777,7 @@ func (c *Ctx) RunParams() error {
 		case runner.HasTool("nuclei") && runner.NonEmpty(ssrfFile):
 			runner.Info("nuclei SSRF probe on %d candidate(s)…", runner.CountLines(ssrfFile))
 			out := filepath.Join(dir, "nuclei_ssrf.txt")
-			cmd := c.cmd("nuclei", "-l", ssrfFile,
+			cmd := c.nucleiCmd("-l", ssrfFile,
 				"-tags", "ssrf,oast",
 				"-H", "User-Agent: "+c.Cfg.BrowserUA,
 				"-rl", strconv.Itoa(c.Cfg.NucleiRate),
@@ -1819,6 +1844,9 @@ func (c *Ctx) RunNuclei() error {
 	runner.Info("Syncing nuclei templates…")
 	sync := c.cmd("nuclei", "-update-templates", "-silent")
 	runner.RunTool("nuclei", c.LogFile, sync)
+	if nucleiTemplatesDir() == "" {
+		runner.Warn("nuclei templates directory not found after sync (~/nuclei-templates missing) — scans may run with 0 templates loaded, producing header/WAF checks only")
+	}
 
 	common := []string{
 		"-H", "User-Agent: " + c.Cfg.BrowserUA,
@@ -1837,14 +1865,14 @@ func (c *Ctx) RunNuclei() error {
 		runner.Info("Scanning %d target(s) — severity: low → critical", len(targetLines))
 		sev := filepath.Join(dir, "_sev.txt")
 		args := append([]string{"-l", primary, "-severity", "low,medium,high,critical", "-o", sev}, common...)
-		cmd := c.cmd("nuclei", args...)
+		cmd := c.nucleiCmd(args...)
 		runner.RunTool("nuclei", c.LogFile, cmd)
 		runner.MergeFiles(raw, sev)
 
 		runner.Info("Scanning %d target(s) — exposures + misconfig", len(targetLines))
 		exp := filepath.Join(dir, "_exp.txt")
 		args = append([]string{"-l", primary, "-tags", "exposures,misconfig", "-o", exp}, common...)
-		cmd = c.cmd("nuclei", args...)
+		cmd = c.nucleiCmd(args...)
 		runner.RunTool("nuclei", c.LogFile, cmd)
 		runner.MergeFiles(raw, exp)
 	}
@@ -1853,7 +1881,7 @@ func (c *Ctx) RunNuclei() error {
 		chlLines, _ := runner.ReadLines(challenged)
 		runner.Info("Gentle pass on %d challenged host(s) (WAF/CDN)…", len(chlLines))
 		chl := filepath.Join(dir, "_chl.txt")
-		cmd := c.cmd("nuclei",
+		cmd := c.nucleiCmd(
 			"-l", challenged, "-severity", "medium,high,critical",
 			"-H", "User-Agent: "+c.Cfg.BrowserUA,
 			"-rl", "20", "-c", "5",
@@ -2043,7 +2071,7 @@ func (c *Ctx) RunTakeover() error {
 		if runner.NonEmpty(base) {
 			runner.Info("nuclei: takeover templates…")
 			out := filepath.Join(dir, "nuclei_takeover.txt")
-			cmd := c.cmd("nuclei", "-l", base, "-tags", "takeover", "-silent",
+			cmd := c.nucleiCmd("-l", base, "-tags", "takeover", "-silent",
 				"-rl", strconv.Itoa(c.Cfg.NucleiRate), "-c", strconv.Itoa(c.Cfg.NucleiConc),
 				"-o", out)
 			runner.RunTool("nuclei", c.LogFile, cmd)
@@ -2547,14 +2575,25 @@ func (c *Ctx) RunHeaders() error {
 	if runner.HasTool("nuclei") {
 		runner.Info("nuclei: security headers…")
 		out := filepath.Join(dir, "nuclei_headers.txt")
-		cmd := c.cmd("nuclei", "-l", clean,
-			"-t", "http/miscellaneous/security-headers.yaml",
-			"-t", "http/technologies/hsts-missing.yaml",
-			"-t", "http/vulnerabilities/generic/crlf-injection.yaml",
-			"-silent", "-o", out,
+		headerTpls := []string{
+			"http/miscellaneous/security-headers.yaml",
+			"http/technologies/hsts-missing.yaml",
+			"http/vulnerabilities/generic/crlf-injection.yaml",
+		}
+		if tplDir := nucleiTemplatesDir(); tplDir != "" {
+			for i, t := range headerTpls {
+				headerTpls[i] = filepath.Join(tplDir, t)
+			}
+		}
+		args := []string{"-l", clean}
+		for _, t := range headerTpls {
+			args = append(args, "-t", t)
+		}
+		args = append(args, "-silent", "-o", out,
 			"-rate-limit", strconv.Itoa(c.Cfg.NucleiRate),
 			"-concurrency", strconv.Itoa(c.Cfg.NucleiConc),
 		)
+		cmd := c.cmd("nuclei", args...)
 		runner.RunTool("nuclei", c.LogFile, cmd)
 		runner.OK("nuclei headers: %d finding(s)", runner.CountLines(out))
 	}
@@ -2732,7 +2771,7 @@ func (c *Ctx) RunGraphQL() error {
 		if runner.HasTool("nuclei") {
 			runner.Info("nuclei: GraphQL security checks…")
 			out := filepath.Join(dir, "nuclei_graphql.txt")
-			cmd := c.cmd("nuclei", "-l", epOut, "-tags", "graphql", "-silent", "-o", out,
+			cmd := c.nucleiCmd("-l", epOut, "-tags", "graphql", "-silent", "-o", out,
 				"-rate-limit", strconv.Itoa(c.Cfg.NucleiRate), "-concurrency", strconv.Itoa(c.Cfg.NucleiConc))
 			runner.RunTool("nuclei", c.LogFile, cmd)
 			runner.OK("nuclei GraphQL: %d finding(s)", runner.CountLines(out))
@@ -2824,7 +2863,7 @@ func (c *Ctx) RunSSL() error {
 		runner.WriteLines(httpsURLs, urls)
 		runner.Info("nuclei: SSL/TLS templates…")
 		out := filepath.Join(dir, "nuclei_ssl.txt")
-		cmd := c.cmd("nuclei", "-l", httpsURLs, "-tags", "ssl,tls", "-silent", "-o", out,
+		cmd := c.nucleiCmd("-l", httpsURLs, "-tags", "ssl,tls", "-silent", "-o", out,
 			"-rate-limit", strconv.Itoa(c.Cfg.NucleiRate), "-concurrency", strconv.Itoa(c.Cfg.NucleiConc))
 		runner.RunTool("nuclei", c.LogFile, cmd)
 		runner.OK("nuclei SSL: %d finding(s)", runner.CountLines(out))

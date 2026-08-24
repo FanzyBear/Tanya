@@ -86,7 +86,7 @@ func Parse(raw string) (*Target, error) {
 	default:
 		// Subdomain given (e.g. www.example.com) — enumerate from apex, crawl within apex only
 		t.ScopeMode = ScopeSemiStrict
-		t.Domain = RegistrableApex(raw) // subfinder/crt.sh use the registrable apex
+		t.Domain = RegistrableApex(raw) // subfinder/crt.name use the registrable apex
 	}
 	return t, nil
 }

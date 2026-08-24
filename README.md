@@ -101,7 +101,7 @@ when a prerequisite hasn't run yet.
 
 | # | Module | What it does | Key tools |
 |---|--------|--------------|-----------|
-| 1 | **Subdomain Enum** | Active + passive discovery, cert transparency, DNS bruteforce | subfinder, assetfinder, amass, chaos, crt.sh, dnsx |
+| 1 | **Subdomain Enum** | Active + passive discovery, cert transparency, DNS bruteforce | subfinder, assetfinder, amass, chaos, crt.name, dnsx |
 | 2 | **HTTP Probe + WAF** | Live detection, tech stack, WAF fingerprint, edge challenge classification | httpx, nuclei |
 | 3 | **Origin Discovery** | CDN vs origin classification, direct-connect verification | cdncheck, dnsx |
 | 4 | **Port Scanning** | Top-1000 ports + high-risk flagging (Docker, Redis, Elastic, etcd…) | naabu |
